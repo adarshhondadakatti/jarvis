@@ -785,9 +785,6 @@ class JarvisLive:
             realtime_input_config=types.RealtimeInputConfig(
                 automatic_activity_detection=types.AutomaticActivityDetection(
                     silence_duration_ms=vad_silence_ms,
-                    # Hard cap on how long the model can speak per turn.
-                    # Without this, the server may default to a short limit.
-                    max_speaking_duration_ms=vad_silence_ms,
                 )
             ),
             # Allow longer responses by increasing max output tokens (default may be low).

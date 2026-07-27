@@ -174,21 +174,39 @@ def _process_pdf(path: Path, action: str, params: dict, speak=None) -> str:
 
     def _extract_pdf_text(max_chars=50000) -> str:
         text = ""
+        # Try pdfplumber first (best text layout preservation)
         try:
             import pdfplumber
             with pdfplumber.open(path) as pdf:
                 for page in pdf.pages:
                     text += (page.extract_text() or "") + "\n"
+            if text.strip():
+                return text[:max_chars]
         except ImportError:
-            try:
-                import PyPDF2
-                with open(path, "rb") as f:
-                    reader = PyPDF2.PdfReader(f)
-                    for page in reader.pages:
-                        text += page.extract_text() + "\n"
-            except ImportError:
-                return ""
-        return text[:max_chars]
+            pass
+        # Fallback: PyPDF2
+        try:
+            import PyPDF2
+            with open(path, "rb") as f:
+                reader = PyPDF2.PdfReader(f)
+                for page in reader.pages:
+                    text += page.extract_text() + "\n"
+            if text.strip():
+                return text[:max_chars]
+        except ImportError:
+            pass
+        # Fallback: pymupdf (fitz) — already a project dependency
+        try:
+            import fitz
+            doc = fitz.open(path)
+            for page in doc:
+                text += page.get_text() + "\n"
+            doc.close()
+            if text.strip():
+                return text[:max_chars]
+        except Exception:
+            pass
+        return text[:max_chars] if text else ""
 
     if action in ("summarize", "extract_text", "translate_hint", "analyze", "reformat"):
         text = _extract_pdf_text()
@@ -862,6 +880,23 @@ def _process_pptx(path: Path, action: str, params: dict, speak=None) -> str:
 
     return f"Unknown PPTX action: '{action}'. Try: summarize, extract_text, analyze"
 
+def _unblock_file(path: Path) -> bool:
+    """Remove Windows Zone.Identifier stream that blocks downloaded files.
+    Returns True if the file was unblocked or didn't need it."""
+    try:
+        import platform
+        if platform.system() != "Windows":
+            return True
+        # Try removing the Zone.Identifier ADS directly
+        ads = Path(f"{path}:Zone.Identifier")
+        if ads.exists():
+            ads.unlink()
+            return True
+        return True
+    except Exception:
+        return True
+
+
 def file_processor(parameters: dict, player=None, speak=None) -> str:
     file_path_str = parameters.get("file_path", "").strip()
     if not file_path_str:
@@ -872,6 +907,9 @@ def file_processor(parameters: dict, player=None, speak=None) -> str:
         return f"File not found: {file_path_str}"
     if not path.is_file():
         return f"Path is not a file: {file_path_str}"
+
+    # Unblock Windows-downloaded files (removes Zone.Identifier stream)
+    _unblock_file(path)
 
     file_type   = _detect_type(path)
     action      = (parameters.get("action") or "").lower().strip()
