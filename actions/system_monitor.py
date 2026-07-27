@@ -5,6 +5,7 @@ Zero subprocess calls on all platforms — uses ctypes/pynvml/psutil/wmi only.
 import ctypes
 import platform
 import time
+from datetime import datetime
 
 import psutil
 
@@ -131,6 +132,7 @@ def get_system_status() -> dict:
         "gpu_percent":   round(gpu,  1) if gpu  >= 0 else None,
         "uptime":        f"{uptime_h}h {uptime_m}m",
         "process_count": len(psutil.pids()),
+        "current_time":  datetime.now().strftime("%A, %B %d, %Y — %I:%M %p"),
     }
 
 
