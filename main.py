@@ -534,16 +534,17 @@ TOOL_DECLARATIONS = [
     {
         "name": "email",
         "description": (
-            "Manages email via Gmail API. Actions: fetch (get unread emails), process (fetch + AI reply drafts), "
-            "auth (run OAuth flow), status (check auth status). Creates draft replies for human review — "
-            "does NOT send emails directly. Use 'fetch' to see recent unread, 'process' to generate AI replies."
+            "Manages Gmail via API: fetch unread emails, generate AI replies, create drafts, and send emails. "
+            "Actions: fetch (list unread), process (fetch + AI drafts), draft (create draft reply), "
+            "send (send email immediately or reply to an email), auth (run OAuth flow), status (check auth). "
+            "Use 'fetch' to see recent unread, 'process' to generate AI reply drafts, 'send' to send an email."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
                 "action": {
                     "type": "STRING",
-                    "description": "fetch | process | auth | status (default: fetch)"
+                    "description": "fetch | process | draft | send | auth | status (default: fetch)"
                 },
                 "max_results": {
                     "type": "INTEGER",
@@ -553,9 +554,33 @@ TOOL_DECLARATIONS = [
                     "type": "INTEGER",
                     "description": "Days back to search (default: 7)"
                 },
+                "email_id": {
+                    "type": "STRING",
+                    "description": "Specific email ID for draft or send action (reply to this email)"
+                },
+                "to": {
+                    "type": "STRING",
+                    "description": "Recipient email address (for send action)"
+                },
+                "subject": {
+                    "type": "STRING",
+                    "description": "Email subject line (for send action)"
+                },
+                "body": {
+                    "type": "STRING",
+                    "description": "Email body content (for send action). If empty and replying via email_id, AI generates the reply."
+                },
+                "use_ai": {
+                    "type": "BOOLEAN",
+                    "description": "Generate reply body via AI when replying to an email (default: true)"
+                },
                 "instructions": {
                     "type": "STRING",
                     "description": "Custom instructions for AI reply generation"
+                },
+                "mark_read": {
+                    "type": "BOOLEAN",
+                    "description": "Mark emails as read after processing (default: true)"
                 },
             },
             "required": ["action"]
@@ -932,6 +957,12 @@ class JarvisLive:
                 max_results = args.get("max_results", 10)
                 days_back = args.get("days_back", 7)
                 instructions = args.get("instructions", "")
+                email_id = args.get("email_id", "")
+                to_addr = args.get("to", "")
+                subject = args.get("subject", "")
+                body = args.get("body", "")
+                use_ai = args.get("use_ai", True)
+                mark_read = args.get("mark_read", True)
 
                 if action == "auth":
                     from actions.email import force_reauth
@@ -953,6 +984,12 @@ class JarvisLive:
                                 "max_results": max_results,
                                 "days_back": days_back,
                                 "instructions": instructions,
+                                "email_id": email_id,
+                                "to": to_addr,
+                                "subject": subject,
+                                "body": body,
+                                "use_ai": use_ai,
+                                "mark_read": mark_read,
                             },
                             player=self.ui,
                         )

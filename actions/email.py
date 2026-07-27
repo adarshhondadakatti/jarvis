@@ -613,6 +613,76 @@ def create_draft_reply(
             raise TokenExpiredError("Authentication failed creating draft")
         raise EmailError(f"Failed to create draft: {e}")
 # ───────────────────────────────────────────────────────────────────────────────
+# Email Sending
+# ───────────────────────────────────────────────────────────────────────────────
+
+def send_email(
+    to: str,
+    subject: str,
+    body: str,
+    user_email: str = "",
+    thread_id: str = "",
+    in_reply_to: str = "",
+    references: str = "",
+) -> dict:
+    """
+    Send an email immediately via Gmail API.
+
+    Args:
+        to: Recipient email address
+        subject: Email subject line
+        body: Plain-text email body
+        user_email: Your email address (for From header)
+        thread_id: Optional thread ID to send as reply in existing thread
+        in_reply_to: Optional Message-ID this email replies to
+        references: Optional References header for threading
+
+    Returns:
+        Dict with message_id, thread_id, and status
+    """
+    service = get_gmail_service()
+
+    # Build the email message
+    message = MIMEText(body)
+    message["To"] = to
+    message["Subject"] = subject
+    if user_email:
+        message["From"] = user_email
+    if in_reply_to:
+        message["In-Reply-To"] = in_reply_to
+    if references:
+        message["References"] = references
+
+    # Encode for Gmail API
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+
+    # Build the send request body
+    send_body: dict[str, Any] = {"raw": raw}
+    if thread_id:
+        send_body["threadId"] = thread_id
+
+    try:
+        req = service.users().messages().send(userId="me", body=send_body)
+        sent = _execute_with_retry(req)
+
+        message_id = sent.get("id", "")
+        result_thread_id = sent.get("threadId", thread_id or "")
+
+        print(f"[Email] ✅ Email sent to {to} (message ID: {message_id})")
+        return {
+            "status": "sent",
+            "message_id": message_id,
+            "thread_id": result_thread_id,
+            "to": to,
+            "subject": subject,
+        }
+    except HttpError as e:
+        if e.resp.status == 401:
+            raise TokenExpiredError("Authentication failed sending email")
+        elif e.resp.status == 403:
+            raise AuthenticationError(f"Insufficient permissions to send: {e}")
+        raise EmailError(f"Failed to send email: {e}")
+# ───────────────────────────────────────────────────────────────────────────────
 # High-Level Workflow
 # ───────────────────────────────────────────────────────────────────────────────
 
@@ -757,14 +827,19 @@ def email_action(
     - fetch: Fetch recent unread emails (returns summaries)
     - process: Fetch + generate AI replies + create drafts
     - draft: Create a draft reply for a specific email (requires email_id)
+    - send: Send an email immediately (requires to, subject, body) or reply to an email (requires email_id)
     - auth: Force re-authentication
     - status: Check authentication status
 
     Parameters:
-        action: "fetch" | "process" | "draft" | "auth" | "status"
+        action: "fetch" | "process" | "draft" | "send" | "auth" | "status"
         max_results: Max emails to fetch (default: 10)
         days_back: Days back to search (default: 7)
-        email_id: Specific email ID for draft action
+        email_id: Specific email ID for draft/send action
+        to: Recipient email address (for send action)
+        subject: Email subject (for send action)
+        body: Email body (for send action)
+        use_ai: Generate reply body via AI when replying (default: true)
         custom_instructions / instructions: Additional AI instructions
         mark_read: Whether to mark as read after processing (default: true)
     """
@@ -774,6 +849,11 @@ def email_action(
     # Accept both parameter names for compatibility
     custom_instructions = parameters.get("custom_instructions") or parameters.get("instructions", "")
     mark_read = parameters.get("mark_read", True)
+    # Send action parameters
+    to_addr = parameters.get("to", "").strip()
+    subject = parameters.get("subject", "").strip()
+    body = parameters.get("body", "").strip()
+    use_ai = parameters.get("use_ai", True)
 
     # Load user config
     user_name = load_api_keys().get("user_name", "")
@@ -873,8 +953,69 @@ def email_action(
                 f"Preview:\n{reply[:300]}..."
             )
 
+        elif action == "send":
+            email_id = parameters.get("email_id")
+
+            # Mode 1: Reply to an existing email (requires email_id)
+            if email_id:
+                service = get_gmail_service()
+                msg = _execute_with_retry(
+                    service.users().messages().get(userId="me", id=email_id, format="full")
+                )
+                email = _parse_gmail_message(msg)
+
+                # Generate reply body via AI if not provided
+                if not body and use_ai:
+                    reply = generate_ai_reply(
+                        email=email,
+                        user_name=user_name,
+                        user_context=user_context,
+                        custom_instructions=custom_instructions,
+                    )
+                else:
+                    reply = body
+
+                # Send the email as a reply in the same thread
+                result = send_email(
+                    to=email.sender,
+                    subject=email.subject if email.subject.lower().startswith("re:") else f"Re: {email.subject}",
+                    body=reply,
+                    user_email=user_email,
+                    thread_id=email.thread_id,
+                    in_reply_to=email.id,
+                    references=f"{email.references} {email.id}".strip() if email.references else email.id,
+                )
+
+                return (
+                    f"✅ Email sent to {result['to']}\n"
+                    f"Subject: {result['subject']}\n"
+                    f"Message ID: {result['message_id']}\n\n"
+                    f"Preview:\n{reply[:300]}..."
+                )
+
+            # Mode 2: Send a new email (requires to, subject, body)
+            if not to_addr:
+                return "❌ Please provide 'to' (recipient email address) for send action"
+            if not subject:
+                return "❌ Please provide 'subject' for send action"
+            if not body:
+                return "❌ Please provide 'body' for send action"
+
+            result = send_email(
+                to=to_addr,
+                subject=subject,
+                body=body,
+                user_email=user_email,
+            )
+
+            return (
+                f"✅ Email sent to {result['to']}\n"
+                f"Subject: {result['subject']}\n"
+                f"Message ID: {result['message_id']}"
+            )
+
         else:
-            return f"❌ Unknown action: {action}. Use: fetch, process, draft, auth, status"
+            return f"❌ Unknown action: {action}. Use: fetch, process, draft, send, auth, status"
 
     except TokenExpiredError:
         return ("❌ Authentication expired. Please run email action with action='auth' "
@@ -897,9 +1038,9 @@ def email_action(
 EMAIL_TOOL_DECLARATION = {
     "name": "email",
     "description": (
-        "Manages Gmail via API: fetch unread emails, generate AI replies, create drafts. "
-        "Does NOT send emails directly — creates drafts for your review. "
-        "Actions: fetch (list unread), process (fetch + AI drafts), draft (reply to specific email), "
+        "Manages Gmail via API: fetch unread emails, generate AI replies, create drafts, "
+        "and send emails. Actions: fetch (list unread), process (fetch + AI drafts), "
+        "draft (create draft reply), send (send email immediately or reply to an email), "
         "auth (re-authenticate), status (check auth)."
     ),
     "parameters": {
@@ -907,8 +1048,8 @@ EMAIL_TOOL_DECLARATION = {
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "fetch | process | draft | auth | status",
-                "enum": ["fetch", "process", "draft", "auth", "status"],
+                "description": "fetch | process | draft | send | auth | status",
+                "enum": ["fetch", "process", "draft", "send", "auth", "status"],
             },
             "max_results": {
                 "type": "INTEGER",
@@ -920,7 +1061,23 @@ EMAIL_TOOL_DECLARATION = {
             },
             "email_id": {
                 "type": "STRING",
-                "description": "Specific email ID for draft action",
+                "description": "Specific email ID for draft or send action (reply to this email)",
+            },
+            "to": {
+                "type": "STRING",
+                "description": "Recipient email address (for send action)",
+            },
+            "subject": {
+                "type": "STRING",
+                "description": "Email subject line (for send action)",
+            },
+            "body": {
+                "type": "STRING",
+                "description": "Email body content (for send action). If empty and replying via email_id, AI generates the reply.",
+            },
+            "use_ai": {
+                "type": "BOOLEAN",
+                "description": "Generate reply body via AI when replying to an email (default: true)",
             },
             "custom_instructions": {
                 "type": "STRING",
