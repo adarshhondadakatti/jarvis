@@ -16,8 +16,7 @@ on first use, not at import time.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -25,7 +24,6 @@ import numpy as np
 # ── Optional dependency check ──────────────────────────────────────────────────
 
 try:
-    import insightface
     from insightface.app import FaceAnalysis
     _INSIGHTFACE_AVAILABLE = True
 except ImportError:
@@ -158,7 +156,10 @@ class FaceBackend:
         """
         app = self._ensure_loaded()
         img = self._decode_image(image_bytes)
-        faces = app.get(img, order="size")  # largest faces first
+        faces = app.get(img)  # largest faces first (sorted below)
+
+        # Sort by face area (largest first)
+        faces.sort(key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]), reverse=True)
 
         results = []
         for face in faces:
@@ -207,7 +208,10 @@ class FaceBackend:
         """
         app = self._ensure_loaded()
         img = self._decode_image(image_bytes)
-        faces = app.get(img, order="size")
+        faces = app.get(img)
+
+        # Sort by face area (largest first)
+        faces.sort(key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]), reverse=True)
 
         results = []
         for face in faces:
