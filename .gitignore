@@ -5,3 +5,5 @@ config/*
 !config/*.py
 *.vsix
 logs/*
+memory/*
+*.db
