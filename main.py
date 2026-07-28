@@ -57,6 +57,7 @@ from actions.game_updater      import game_updater
 from actions.system_monitor    import SystemMonitor, get_system_status
 from actions.proactive         import ProactiveEngine
 from actions.web_search        import _news as _fetch_news_sync
+from actions.meeting_recorder  import MeetingRecorder, ScreenRecorder, _base_dir as _recorder_base_dir
 from memory.config_manager     import get_brief_enabled, get_vad_silence_timeout_ms
 from actions.email             import email_action
 from memory.config_manager     import get_brief_enabled
@@ -534,19 +535,17 @@ TOOL_DECLARATIONS = [
     {
         "name": "email",
         "description": (
-            "Manages Gmail via API: fetch emails, generate AI replies, create drafts, send emails, "
-            "and summarize emails. Actions: fetch (list emails), process (fetch + AI drafts), "
-            "draft (create draft reply), send (send email immediately), reply (reply to a specific email via AI), "
-            "summarize (generate AI summaries of emails), auth (run OAuth flow), status (check auth). "
-            "Use 'fetch' to see emails, 'process' to generate AI reply drafts, 'send' to send an email, "
-            "'reply' to reply to a specific email by ID, 'summarize' to get AI summaries of emails."
+            "Manages Gmail via API: fetch unread emails, generate AI replies, create drafts, and send emails. "
+            "Actions: fetch (list unread), process (fetch + AI drafts), draft (create draft reply), "
+            "send (send email immediately or reply to an email), auth (run OAuth flow), status (check auth). "
+            "Use 'fetch' to see recent unread, 'process' to generate AI reply drafts, 'send' to send an email."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
                 "action": {
                     "type": "STRING",
-                    "description": "fetch | process | draft | send | reply | summarize | auth | status (default: fetch)"
+                    "description": "fetch | process | draft | send | auth | status (default: fetch)"
                 },
                 "max_results": {
                     "type": "INTEGER",
@@ -556,17 +555,9 @@ TOOL_DECLARATIONS = [
                     "type": "INTEGER",
                     "description": "Days back to search (default: 7)"
                 },
-                "include_read": {
-                    "type": "BOOLEAN",
-                    "description": "Include read emails in fetch results (default: false, only unread)"
-                },
-                "query": {
-                    "type": "STRING",
-                    "description": "Custom Gmail search query (e.g. 'from:boss@example.com')"
-                },
                 "email_id": {
                     "type": "STRING",
-                    "description": "Specific email ID for draft, send, or reply action"
+                    "description": "Specific email ID for draft or send action (reply to this email)"
                 },
                 "to": {
                     "type": "STRING",
@@ -578,7 +569,7 @@ TOOL_DECLARATIONS = [
                 },
                 "body": {
                     "type": "STRING",
-                    "description": "Email body (for send action). If empty and replying via email_id, AI generates the reply."
+                    "description": "Email body content (for send action). If empty and replying via email_id, AI generates the reply."
                 },
                 "use_ai": {
                     "type": "BOOLEAN",
@@ -615,6 +606,39 @@ TOOL_DECLARATIONS = [
                 }
             },
             "required": ["name"]
+        }
+    },
+    {
+        "name": "toggle_screen_recording",
+        "description": (
+            "Start or stop recording the user's screen to a video file. "
+            "Call this when the user says things like 'start recording my screen', "
+            "'record my screen', 'stop screen recording', or similar. "
+            "This toggles: if a recording is already running, it stops it; "
+            "if none is running, it starts one. Does not capture microphone audio — "
+            "use toggle_meeting_notes for that."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {},
+            "required": []
+        }
+    },
+    {
+        "name": "toggle_meeting_notes",
+        "description": (
+            "Start or stop recording meeting notes: captures microphone audio AND "
+            "the screen together. When stopped, the audio is automatically "
+            "transcribed and summarized (key points, decisions, action items) via Gemini. "
+            "Call this when the user says things like 'take notes for this meeting', "
+            "'start meeting notes', 'stop meeting notes', or similar. "
+            "This toggles: if a session is already running, it stops it and triggers "
+            "the summary; if none is running, it starts one."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {},
+            "required": []
         }
     },
     {
@@ -677,6 +701,8 @@ class JarvisLive:
         self.ui.on_text_command   = self._on_text_command
         self.ui.on_remote_clicked = self._make_remote_key
         self.ui.on_interrupt      = self.interrupt
+        self.ui.on_toggle_screen_record = self._toggle_screen_recording
+        self.ui.on_toggle_meeting_notes = self._toggle_meeting_notes
         self._turn_done_event: asyncio.Event | None = None
         self._dashboard     = None
         self._briefing_sent    = False          # morning briefing fires once per process
@@ -688,6 +714,10 @@ class JarvisLive:
         self._face_memory   = FaceMemory()
         self._media_memory  = MediaMemory()
         self._event_memory  = EventMemory()
+
+        # Standalone screen recording + combined meeting notes (audio+screen)
+        self._screen_recorder   = ScreenRecorder(fps=4)
+        self._meeting_recorder  = MeetingRecorder()
 
     def _make_remote_key(self):
         """Called from Qt main thread when user presses Remote Control."""
@@ -701,6 +731,51 @@ class JarvisLive:
         url    = self._dashboard.get_url()
         manual = self._dashboard.get_manual_url()
         return url, key, f"{url}/auto-login?key={key}", manual
+
+    # --- Screen recording (standalone) --------------------------------------
+    def _toggle_screen_recording(self):
+        """Called from the F8 hotkey (Qt main thread) and from the voice tool."""
+        if self._screen_recorder.active:
+            try:
+                path = self._screen_recorder.stop()
+                self.ui.write_log(f"SYS: Screen recording stopped. Saved to {path}")
+                return f"Screen recording saved to {path}"
+            except Exception as e:
+                self.ui.write_log(f"SYS: Screen recording error: {e}")
+                return f"Screen recording failed: {e}"
+        else:
+            try:
+                ts      = time.strftime("%Y-%m-%d_%H-%M-%S")
+                out_dir = _recorder_base_dir() / "recordings"
+                path    = out_dir / f"screen_{ts}.mp4"
+                self._screen_recorder.start(path)
+                self.ui.write_log(f"SYS: Screen recording started → {path.name}")
+                return "Screen recording started."
+            except Exception as e:
+                self.ui.write_log(f"SYS: Could not start screen recording: {e}")
+                return f"Could not start screen recording: {e}"
+
+    # --- Meeting notes (mic audio + screen, transcribed + summarized) ------
+    def _toggle_meeting_notes(self):
+        """Called from the F9 hotkey (Qt main thread) and from the voice tool."""
+        if self._meeting_recorder.active:
+            session_dir = self._meeting_recorder.stop()
+            self.ui.write_log("SYS: Meeting recording stopped. Generating summary…")
+
+            def _finish():
+                try:
+                    summary = self._meeting_recorder.summarize(session_dir)
+                    self.ui.write_log(f"SYS: Meeting summary saved → {session_dir / 'summary.md'}")
+                    self.ui.write_log(summary)
+                except Exception as e:
+                    self.ui.write_log(f"SYS: Meeting summary failed: {e}")
+
+            threading.Thread(target=_finish, daemon=True).start()
+            return "Meeting recording stopped. Summarizing now."
+        else:
+            session_dir = self._meeting_recorder.start()
+            self.ui.write_log(f"SYS: Meeting recording started → {session_dir.name}")
+            return "Meeting recording started."
 
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:
@@ -966,8 +1041,6 @@ class JarvisLive:
                 action = args.get("action", "fetch")
                 max_results = args.get("max_results", 10)
                 days_back = args.get("days_back", 7)
-                include_read = args.get("include_read", False)
-                query = args.get("query", "")
                 instructions = args.get("instructions", "")
                 email_id = args.get("email_id", "")
                 to_addr = args.get("to", "")
@@ -995,8 +1068,6 @@ class JarvisLive:
                                 "action": action,
                                 "max_results": max_results,
                                 "days_back": days_back,
-                                "include_read": include_read,
-                                "query": query,
                                 "instructions": instructions,
                                 "email_id": email_id,
                                 "to": to_addr,
@@ -1042,6 +1113,18 @@ class JarvisLive:
                             result = f"I couldn't detect a face in the camera frame. Please make sure you're facing the camera and try again."
                     except Exception as e:
                         result = f"Face enrollment failed: {e}. Make sure insightface is installed."
+
+            elif name == "toggle_screen_recording":
+                try:
+                    result = self._toggle_screen_recording()
+                except Exception as e:
+                    result = f"Screen recording toggle failed: {e}"
+
+            elif name == "toggle_meeting_notes":
+                try:
+                    result = self._toggle_meeting_notes()
+                except Exception as e:
+                    result = f"Meeting notes toggle failed: {e}"
 
             elif name == "recognize_person":
                 try:
@@ -1133,10 +1216,17 @@ class JarvisLive:
         loop = asyncio.get_event_loop()
 
         def callback(indata, frames, time_info, status):
+            data = indata.tobytes()
+
+            # Meeting notes tap into the raw mic stream regardless of mute state
+            # or whether JARVIS is currently speaking — a meeting session should
+            # capture everything said in the room.
+            if self._meeting_recorder.active:
+                self._meeting_recorder.feed_audio(data)
+
             with self._speaking_lock:
                 jarvis_speaking = self._is_speaking
             if not jarvis_speaking and not self.ui.muted and not self._phone_active:
-                data = indata.tobytes()
                 loop.call_soon_threadsafe(
                     self.out_queue.put_nowait,
                     {"data": data, "mime_type": "audio/pcm"}
