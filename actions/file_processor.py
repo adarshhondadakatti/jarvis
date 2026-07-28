@@ -169,6 +169,87 @@ def _process_image(path: Path, action: str, params: dict, speak=None) -> str:
 
     return _process_image(path, "describe", {"instruction": f"{action}: {params}"})
 
+def _summarize_pdf_as_images(path: Path, action: str, params: dict) -> str:
+    """
+    Fallback for scanned/image-based PDFs: extract images from the PDF
+    (embedded images first, then rendered page images) and summarize them
+    using Gemini vision.
+    """
+    try:
+        import fitz  # PyMuPDF — availability check
+    except ImportError:
+        return (
+            "Could not extract text from PDF (may be scanned/image-based). "
+            "PyMuPDF is not installed. Run: pip install pymupdf"
+        )
+
+    try:
+        from PIL import Image
+    except ImportError:
+        return (
+            "Could not extract text from PDF (may be scanned/image-based). "
+            "Pillow is not installed. Run: pip install Pillow"
+        )
+
+    import io as _io
+
+    # Step 1: Try to extract embedded images first
+    try:
+        max_images = int(params.get("max_images", 20))
+    except (TypeError, ValueError):
+        max_images = 20
+
+    raw_images = _extract_pdf_images(path, max_images=max_images)
+
+    # Step 2: If no embedded images, render pages as images
+    if not raw_images:
+        try:
+            raw_images = _render_pdf_pages_as_images(path, max_pages=max_images)
+        except Exception:
+            pass
+
+    if not raw_images:
+        return (
+            "Could not extract text from PDF (may be scanned/image-based), "
+            "and no images could be extracted from the PDF."
+        )
+
+    # Convert raw bytes to PIL Images
+    pil_images = []
+    for b in raw_images:
+        try:
+            pil_images.append(Image.open(_io.BytesIO(b)))
+        except Exception:
+            continue
+
+    if not pil_images:
+        return (
+            "Could not extract text from PDF (may be scanned/image-based), "
+            "and the extracted images could not be decoded."
+        )
+
+    # Step 3: Summarize images with Gemini vision
+    try:
+        model = _gemini_client()
+        action_label = "summarize" if action == "summarize" else "analyze"
+        prompt = params.get("instruction") or (
+            f"These {len(pil_images)} images were extracted from the PDF "
+            f"'{path.name}'. Briefly describe what each one shows, then give "
+            f"a short overall summary of what the images collectively convey."
+        )
+        contents = [prompt] + pil_images[:16]
+        response = model.generate_content(contents)
+        result = response.text.strip()
+    except Exception as e:
+        return f"AI image summary failed: {e}"
+
+    # Save if long enough
+    if len(result) > 600 and params.get("save", True):
+        out = _output_path(path, "images_summary", ".txt")
+        out.write_text(result, encoding="utf-8")
+        return f"{result[:400]}...\n\nFull result saved: {out.name}"
+    return result
+
 def _process_pdf(path: Path, action: str, params: dict, speak=None) -> str:
     action = action or "summarize"
 
@@ -211,6 +292,10 @@ def _process_pdf(path: Path, action: str, params: dict, speak=None) -> str:
     if action in ("summarize", "extract_text", "translate_hint", "analyze", "reformat"):
         text = _extract_pdf_text()
         if not text.strip():
+            # Text extraction failed — likely a scanned/image-based PDF.
+            # For "summarize" and "analyze", auto-fallback to image-based summarization.
+            if action in ("summarize", "analyze"):
+                return _summarize_pdf_as_images(path, action, params)
             return "Could not extract text from PDF (may be scanned/image-based)."
 
         if action == "extract_text":
@@ -351,6 +436,29 @@ def _extract_pdf_images(path: Path, max_images: int = 20) -> list[bytes]:
                     images.append(doc.extract_image(xref)["image"])
                 except Exception:
                     continue
+    finally:
+        doc.close()
+    return images
+
+def _render_pdf_pages_as_images(path: Path, max_pages: int = 20) -> list[bytes]:
+    """
+    Renders each PDF page as a PNG image. Used as a fallback for scanned PDFs
+    where text extraction yields nothing and there are no embedded images.
+    Requires PyMuPDF (fitz).
+    Returns a list of PNG image bytes.
+    """
+    import fitz  # PyMuPDF
+
+    images: list[bytes] = []
+    doc = fitz.open(path)
+    try:
+        for page_index in range(min(len(doc), max_pages)):
+            page = doc[page_index]
+            # Render at 150 DPI for a good balance of quality and speed
+            mat = fitz.Matrix(150 / 72, 150 / 72)
+            pix = page.get_pixmap(matrix=mat)
+            images.append(pix.tobytes("png"))
+            pix = None  # release
     finally:
         doc.close()
     return images
@@ -904,7 +1012,13 @@ def file_processor(parameters: dict, player=None, speak=None) -> str:
 
     path = Path(file_path_str)
     if not path.exists():
-        return f"File not found: {file_path_str}"
+        # Try to find the file by name in common directories
+        from actions.file_controller import _find_file_by_name
+        found = _find_file_by_name(file_path_str)
+        if found:
+            path = found
+        else:
+            return f"File not found: {file_path_str}"
     if not path.is_file():
         return f"Path is not a file: {file_path_str}"
 

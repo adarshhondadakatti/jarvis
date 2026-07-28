@@ -39,6 +39,13 @@ def _get_downloads() -> Path:
         xdg = os.environ.get("XDG_DOWNLOAD_DIR", "")
         if xdg and Path(xdg).exists():
             return Path(xdg)
+    # Windows: try USERPROFILE/Downloads, then check known folder via env vars
+    if _OS == "Windows":
+        env_path = os.environ.get("USERPROFILE") or os.environ.get("HOMEPATH")
+        if env_path:
+            candidate = Path(env_path) / "Downloads"
+            if candidate.exists():
+                return candidate
     return Path.home() / "Downloads"
 
 def _get_documents() -> Path:
@@ -70,6 +77,71 @@ def _get_videos() -> Path:
     return Path.home() / "Videos"
 
 
+def _search_dirs() -> list[Path]:
+    """Common directories to search when looking up a file by name."""
+    dirs = [
+        _get_desktop(),
+        _get_downloads(),
+        _get_documents(),
+        _get_pictures(),
+        _get_music(),
+        _get_videos(),
+        Path.home(),
+    ]
+    # De-duplicate while preserving order
+    seen = set()
+    unique = []
+    for d in dirs:
+        try:
+            r = d.resolve()
+            if r not in seen:
+                seen.add(r)
+                unique.append(d)
+        except Exception:
+            pass
+    return unique
+
+def _find_file_by_name(name: str, max_depth: int = 3, max_files: int = 5000) -> Path | None:
+    """
+    Search common directories for a file matching *name*.
+    Searches top-level first (fast), then recursively up to *max_depth* levels.
+    Returns the first match found, or None.
+    """
+    name_lower = name.lower()
+    for search_dir in _search_dirs():
+        if not search_dir.exists() or not search_dir.is_dir():
+            continue
+        try:
+            # Fast path: exact match at top level
+            exact = search_dir / name
+            if exact.is_file():
+                return exact
+
+            # Top-level case-insensitive match
+            for item in search_dir.iterdir():
+                if item.is_file() and item.name.lower() == name_lower:
+                    return item
+
+            # Recursive search in subdirectories (depth-limited)
+            files_checked = 0
+            for root, dirs, files in os.walk(search_dir):
+                # Calculate current depth relative to search_dir
+                rel = os.path.relpath(root, str(search_dir))
+                depth = 0 if rel == "." else rel.count(os.sep) + 1
+                if depth >= max_depth:
+                    dirs[:] = []  # Don't descend further
+                    continue
+                for fname in files:
+                    files_checked += 1
+                    if files_checked > max_files:
+                        dirs[:] = []
+                        break
+                    if fname.lower() == name_lower:
+                        return Path(root) / fname
+        except (PermissionError, OSError):
+            continue
+    return None
+
 def _resolve_path(raw: str) -> Path:
     shortcuts: dict[str, Path] = {
         "desktop":   _get_desktop(),
@@ -83,7 +155,21 @@ def _resolve_path(raw: str) -> Path:
     lower = raw.strip().lower()
     if lower in shortcuts:
         return shortcuts[lower]
-    return Path(raw).expanduser()
+
+    candidate = Path(raw).expanduser()
+
+    # If the path exists as-is (absolute or relative), use it directly
+    if candidate.exists():
+        return candidate
+
+    # If it looks like a bare filename (no path separators), try to find it
+    # by name in common directories (Desktop, Downloads, Documents, etc.)
+    if "/" not in raw and "\\" not in raw and "~" not in raw:
+        found = _find_file_by_name(raw)
+        if found:
+            return found
+
+    return candidate
 
 def _format_size(b: int) -> str:
     for unit in ["B", "KB", "MB", "GB", "TB"]:

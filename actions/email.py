@@ -553,6 +553,69 @@ Date: {email.date.strftime('%Y-%m-%d %H:%M')}
         print(f"[Email] ❌ AI reply generation failed: {e}")
         raise EmailError(f"Failed to generate AI reply: {e}")
 # ───────────────────────────────────────────────────────────────────────────────
+# Email Summarization
+# ───────────────────────────────────────────────────────────────────────────────
+
+SYSTEM_PROMPT_EMAIL_SUMMARY = """You are JARVIS, an AI assistant that summarizes emails concisely.
+Your task: Write a brief, accurate summary of the email content.
+
+Guidelines:
+- Identify the key topic, request, or action item
+- Mention important dates, deadlines, or decisions
+- Keep it to 1-3 sentences
+- Do NOT include meta-commentary or greetings
+- Output ONLY the summary text
+"""
+
+def summarize_email(
+    email: EmailMessage,
+    custom_instructions: str = "",
+) -> str:
+    """
+    Generate a concise AI summary of an email.
+
+    Args:
+        email: The email to summarize
+        custom_instructions: Additional instructions for the AI
+
+    Returns:
+        Plain-text summary (1-3 sentences)
+    """
+    max_body_len = 30000
+    body = email.body_text
+    if len(body) > max_body_len:
+        body = body[:max_body_len] + "\n\n[...truncated...]"
+
+    prompt = f"""Email to summarize:
+From: {email.sender}
+To: {email.recipient}
+Subject: {email.subject}
+Date: {email.date.strftime('%Y-%m-%d %H:%M')}
+---
+{body}
+
+---
+{custom_instructions}"""
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT_EMAIL_SUMMARY},
+        {"role": "user", "content": prompt},
+    ]
+
+    try:
+        response = call_llm(messages, tools=None, timeout=60)
+        summary = response.get("content", "").strip()
+
+        # Clean up any AI meta-commentary
+        if summary.lower().startswith(("here is", "here's a", "summary:", "summary:")):
+            lines = summary.split("\n")
+            summary = "\n".join(lines[1:]).strip()
+
+        return summary
+    except Exception as e:
+        print(f"[Email] ❌ AI summary generation failed: {e}")
+        raise EmailError(f"Failed to generate email summary: {e}")
+# ───────────────────────────────────────────────────────────────────────────────
 # Draft Creation
 # ───────────────────────────────────────────────────────────────────────────────
 
@@ -689,6 +752,8 @@ def send_email(
 def process_unread_emails(
     max_results: int = DEFAULT_MAX_RESULTS,
     days_back: int = DEFAULT_DAYS_BACK,
+    include_read: bool = False,
+    query: Optional[str] = None,
     user_name: str = "",
     user_context: str = "",
     user_email: str = "",
@@ -697,11 +762,13 @@ def process_unread_emails(
     target_email_ids: Optional[List[str]] = None,
 ) -> list[dict]:
     """
-    Complete workflow: fetch unread emails → generate AI replies → create drafts.
+    Complete workflow: fetch emails → generate AI replies → create drafts.
 
     Args:
         max_results: Max emails to process
         days_back: How many days back to search
+        include_read: Include read emails (default: false, only unread)
+        query: Custom Gmail search query
         user_name: Your name for sign-off
         user_context: Brief context about you
         user_email: Your email address
@@ -721,7 +788,12 @@ def process_unread_emails(
         user_email = user_email or config.get("user_email", "")
 
     try:
-        emails = fetch_unread_emails(max_results=max_results, days_back=days_back)
+        emails = fetch_unread_emails(
+            max_results=max_results,
+            days_back=days_back,
+            include_read=include_read,
+            query=query,
+        )
     except TokenExpiredError:
         raise
     except Exception as e:
@@ -828,17 +900,21 @@ def email_action(
     - process: Fetch + generate AI replies + create drafts
     - draft: Create a draft reply for a specific email (requires email_id)
     - send: Send an email immediately (requires to, subject, body) or reply to an email (requires email_id)
+    - reply: Reply to a specific email via AI-generated or custom body (requires email_id)
+    - summarize: Fetch emails and generate AI summaries for each
     - auth: Force re-authentication
     - status: Check authentication status
 
     Parameters:
-        action: "fetch" | "process" | "draft" | "send" | "auth" | "status"
+        action: "fetch" | "process" | "draft" | "send" | "reply" | "summarize" | "auth" | "status"
         max_results: Max emails to fetch (default: 10)
         days_back: Days back to search (default: 7)
-        email_id: Specific email ID for draft/send action
+        include_read: Include read emails in fetch results (default: false)
+        query: Custom Gmail search query (e.g. "from:boss@example.com")
+        email_id: Specific email ID for draft/send/reply action
         to: Recipient email address (for send action)
         subject: Email subject (for send action)
-        body: Email body (for send action)
+        body: Email body (for send action). If empty and replying via email_id, AI generates the reply.
         use_ai: Generate reply body via AI when replying (default: true)
         custom_instructions / instructions: Additional AI instructions
         mark_read: Whether to mark as read after processing (default: true)
@@ -846,10 +922,12 @@ def email_action(
     action = parameters.get("action", "fetch").lower()
     max_results = int(parameters.get("max_results", DEFAULT_MAX_RESULTS))
     days_back = int(parameters.get("days_back", DEFAULT_DAYS_BACK))
+    include_read = parameters.get("include_read", False)
+    query = parameters.get("query", "").strip() or None
     # Accept both parameter names for compatibility
     custom_instructions = parameters.get("custom_instructions") or parameters.get("instructions", "")
     mark_read = parameters.get("mark_read", True)
-    # Send action parameters
+    # Send/reply action parameters
     to_addr = parameters.get("to", "").strip()
     subject = parameters.get("subject", "").strip()
     body = parameters.get("body", "").strip()
@@ -881,15 +959,24 @@ def email_action(
                 return "❌ Not authenticated. Run with action='auth' to set up."
 
         elif action == "fetch":
-            emails = fetch_unread_emails(max_results=max_results, days_back=days_back)
+            emails = fetch_unread_emails(
+                max_results=max_results,
+                days_back=days_back,
+                include_read=include_read,
+                query=query,
+            )
             if not emails:
-                return "📭 No unread emails found."
+                label = "emails" if include_read else "unread emails"
+                return f"📭 No {label} found."
 
-            lines = [f"📬 Found {len(emails)} unread email(s):\n"]
+            label = "emails" if include_read else "unread emails"
+            lines = [f"📬 Found {len(emails)} {label}:\n"]
             for i, e in enumerate(emails, 1):
                 sender_name = e.sender.split("<")[0].strip() if "<" in e.sender else e.sender
-                lines.append(f"{i}. **{sender_name}** — {e.subject}")
+                unread_tag = " [UNREAD]" if e.is_unread else ""
+                lines.append(f"{i}. **{sender_name}** — {e.subject}{unread_tag}")
                 lines.append(f"   📅 {e.date.strftime('%Y-%m-%d %H:%M')}  |  📝 {e.snippet[:80]}...")
+                lines.append(f"   ID: {e.id}")
                 lines.append("")
             return "\n".join(lines)
 
@@ -897,6 +984,8 @@ def email_action(
             results = process_unread_emails(
                 max_results=max_results,
                 days_back=days_back,
+                include_read=include_read,
+                query=query,
                 user_name=user_name,
                 user_context=user_context,
                 user_email=user_email,
@@ -908,7 +997,7 @@ def email_action(
             drafts = [r for r in results if r.get("status") == "draft_created"]
             errors = [r for r in results if r.get("status") == "error"]
 
-            lines = [f"✅ Processed {len(emails)} email(s) — {len(drafts)} draft(s) created"]
+            lines = [f"✅ Processed {len(results)} email(s) — {len(drafts)} draft(s) created"]
             if errors:
                 lines.append(f"⚠️ {len(errors)} error(s)")
 
@@ -1014,8 +1103,82 @@ def email_action(
                 f"Message ID: {result['message_id']}"
             )
 
+        elif action == "reply":
+            email_id = parameters.get("email_id")
+            if not email_id:
+                return "❌ Please provide 'email_id' to reply to a specific email"
+
+            # Fetch the email to reply to
+            service = get_gmail_service()
+            msg = _execute_with_retry(
+                service.users().messages().get(userId="me", id=email_id, format="full")
+            )
+            email = _parse_gmail_message(msg)
+
+            # Generate reply body via AI if not provided
+            if not body and use_ai:
+                reply = generate_ai_reply(
+                    email=email,
+                    user_name=user_name,
+                    user_context=user_context,
+                    custom_instructions=custom_instructions,
+                )
+            else:
+                reply = body
+
+            # Send the reply in the same thread
+            result = send_email(
+                to=email.sender,
+                subject=email.subject if email.subject.lower().startswith("re:") else f"Re: {email.subject}",
+                body=reply,
+                user_email=user_email,
+                thread_id=email.thread_id,
+                in_reply_to=email.id,
+                references=f"{email.references} {email.id}".strip() if email.references else email.id,
+            )
+
+            return (
+                f"✅ Replied to {email.sender}\n"
+                f"Subject: {result['subject']}\n"
+                f"Message ID: {result['message_id']}\n\n"
+                f"Preview:\n{reply[:300]}..."
+            )
+
+        elif action == "summarize":
+            emails = fetch_unread_emails(
+                max_results=max_results,
+                days_back=days_back,
+                include_read=include_read,
+                query=query,
+            )
+            if not emails:
+                label = "emails" if include_read else "unread emails"
+                return f"📭 No {label} found to summarize."
+
+            label = "emails" if include_read else "unread emails"
+            lines = [f"📋 Summarizing {len(emails)} {label}:\n"]
+
+            for i, email in enumerate(emails, 1):
+                sender_name = email.sender.split("<")[0].strip() if "<" in email.sender else email.sender
+                try:
+                    summary = summarize_email(
+                        email=email,
+                        custom_instructions=custom_instructions,
+                    )
+                    unread_tag = " [UNREAD]" if email.is_unread else ""
+                    lines.append(f"{i}. **{sender_name}** — {email.subject}{unread_tag}")
+                    lines.append(f"   📅 {email.date.strftime('%Y-%m-%d %H:%M')}")
+                    lines.append(f"   📝 Summary: {summary}")
+                    lines.append("")
+                except Exception as e:
+                    lines.append(f"{i}. **{sender_name}** — {email.subject}")
+                    lines.append(f"   ❌ Summary failed: {e}")
+                    lines.append("")
+
+            return "\n".join(lines)
+
         else:
-            return f"❌ Unknown action: {action}. Use: fetch, process, draft, send, auth, status"
+            return f"❌ Unknown action: {action}. Use: fetch, process, draft, send, reply, summarize, auth, status"
 
     except TokenExpiredError:
         return ("❌ Authentication expired. Please run email action with action='auth' "
@@ -1038,9 +1201,10 @@ def email_action(
 EMAIL_TOOL_DECLARATION = {
     "name": "email",
     "description": (
-        "Manages Gmail via API: fetch unread emails, generate AI replies, create drafts, "
-        "and send emails. Actions: fetch (list unread), process (fetch + AI drafts), "
-        "draft (create draft reply), send (send email immediately or reply to an email), "
+        "Manages Gmail via API: fetch emails, generate AI replies, create drafts, "
+        "send emails, and summarize emails. Actions: fetch (list emails), process (fetch + AI drafts), "
+        "draft (create draft reply), send (send email immediately), "
+        "reply (reply to a specific email via AI), summarize (generate AI summaries of emails), "
         "auth (re-authenticate), status (check auth)."
     ),
     "parameters": {
@@ -1048,8 +1212,8 @@ EMAIL_TOOL_DECLARATION = {
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "fetch | process | draft | send | auth | status",
-                "enum": ["fetch", "process", "draft", "send", "auth", "status"],
+                "description": "fetch | process | draft | send | reply | summarize | auth | status",
+                "enum": ["fetch", "process", "draft", "send", "reply", "summarize", "auth", "status"],
             },
             "max_results": {
                 "type": "INTEGER",
@@ -1059,9 +1223,17 @@ EMAIL_TOOL_DECLARATION = {
                 "type": "INTEGER",
                 "description": "How many days back to search (default: 7)",
             },
+            "include_read": {
+                "type": "BOOLEAN",
+                "description": "Include read emails in fetch results (default: false, only unread)",
+            },
+            "query": {
+                "type": "STRING",
+                "description": "Custom Gmail search query (e.g. 'from:boss@example.com')",
+            },
             "email_id": {
                 "type": "STRING",
-                "description": "Specific email ID for draft or send action (reply to this email)",
+                "description": "Specific email ID for draft, send, or reply action",
             },
             "to": {
                 "type": "STRING",
@@ -1073,7 +1245,7 @@ EMAIL_TOOL_DECLARATION = {
             },
             "body": {
                 "type": "STRING",
-                "description": "Email body content (for send action). If empty and replying via email_id, AI generates the reply.",
+                "description": "Email body (for send action). If empty and replying via email_id, AI generates the reply.",
             },
             "use_ai": {
                 "type": "BOOLEAN",

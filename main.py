@@ -534,17 +534,19 @@ TOOL_DECLARATIONS = [
     {
         "name": "email",
         "description": (
-            "Manages Gmail via API: fetch unread emails, generate AI replies, create drafts, and send emails. "
-            "Actions: fetch (list unread), process (fetch + AI drafts), draft (create draft reply), "
-            "send (send email immediately or reply to an email), auth (run OAuth flow), status (check auth). "
-            "Use 'fetch' to see recent unread, 'process' to generate AI reply drafts, 'send' to send an email."
+            "Manages Gmail via API: fetch emails, generate AI replies, create drafts, send emails, "
+            "and summarize emails. Actions: fetch (list emails), process (fetch + AI drafts), "
+            "draft (create draft reply), send (send email immediately), reply (reply to a specific email via AI), "
+            "summarize (generate AI summaries of emails), auth (run OAuth flow), status (check auth). "
+            "Use 'fetch' to see emails, 'process' to generate AI reply drafts, 'send' to send an email, "
+            "'reply' to reply to a specific email by ID, 'summarize' to get AI summaries of emails."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
                 "action": {
                     "type": "STRING",
-                    "description": "fetch | process | draft | send | auth | status (default: fetch)"
+                    "description": "fetch | process | draft | send | reply | summarize | auth | status (default: fetch)"
                 },
                 "max_results": {
                     "type": "INTEGER",
@@ -554,9 +556,17 @@ TOOL_DECLARATIONS = [
                     "type": "INTEGER",
                     "description": "Days back to search (default: 7)"
                 },
+                "include_read": {
+                    "type": "BOOLEAN",
+                    "description": "Include read emails in fetch results (default: false, only unread)"
+                },
+                "query": {
+                    "type": "STRING",
+                    "description": "Custom Gmail search query (e.g. 'from:boss@example.com')"
+                },
                 "email_id": {
                     "type": "STRING",
-                    "description": "Specific email ID for draft or send action (reply to this email)"
+                    "description": "Specific email ID for draft, send, or reply action"
                 },
                 "to": {
                     "type": "STRING",
@@ -568,7 +578,7 @@ TOOL_DECLARATIONS = [
                 },
                 "body": {
                     "type": "STRING",
-                    "description": "Email body content (for send action). If empty and replying via email_id, AI generates the reply."
+                    "description": "Email body (for send action). If empty and replying via email_id, AI generates the reply."
                 },
                 "use_ai": {
                     "type": "BOOLEAN",
@@ -956,6 +966,8 @@ class JarvisLive:
                 action = args.get("action", "fetch")
                 max_results = args.get("max_results", 10)
                 days_back = args.get("days_back", 7)
+                include_read = args.get("include_read", False)
+                query = args.get("query", "")
                 instructions = args.get("instructions", "")
                 email_id = args.get("email_id", "")
                 to_addr = args.get("to", "")
@@ -983,6 +995,8 @@ class JarvisLive:
                                 "action": action,
                                 "max_results": max_results,
                                 "days_back": days_back,
+                                "include_read": include_read,
+                                "query": query,
                                 "instructions": instructions,
                                 "email_id": email_id,
                                 "to": to_addr,
