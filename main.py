@@ -57,6 +57,7 @@ from actions.game_updater      import game_updater
 from actions.system_monitor    import SystemMonitor, get_system_status
 from actions.proactive         import ProactiveEngine
 from actions.web_search        import _news as _fetch_news_sync
+from actions.meeting_recorder  import MeetingRecorder, ScreenRecorder, _base_dir as _recorder_base_dir
 from memory.config_manager     import get_brief_enabled, get_vad_silence_timeout_ms
 from actions.email             import email_action
 from memory.config_manager     import get_brief_enabled
