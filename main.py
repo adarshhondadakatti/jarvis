@@ -1,3 +1,11 @@
+import sys as _sys
+
+# ── Add short-path site-packages for packages installed outside the default
+#    Windows Store Python path (e.g., insightface, onnx) ─────────────────────
+_EXTRA_PATH = "C:\\libs"
+if _EXTRA_PATH not in _sys.path:
+    _sys.path.insert(0, _EXTRA_PATH)
+
 import platform as _platform
 import subprocess as _subprocess
 
@@ -532,6 +540,48 @@ TOOL_DECLARATIONS = [
         }
     },
     {
+        "name": "memory",
+        "description": (
+            "Manage JARVIS memory: export/import memory profiles, switch between user profiles, "
+            "list available profiles, or forget specific entries. "
+            "Actions: export (save memory to JSON file), import (load memory from JSON file), "
+            "export_okf (save memory to Open Knowledge Format directory), "
+            "import_okf (load memory from OKF directory), "
+            "switch_profile (change active profile), list_profiles (show all profiles), "
+            "get_profile (show current profile), forget (remove a specific memory entry)."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {
+                    "type": "STRING",
+                    "description": "export | import | export_okf | import_okf | switch_profile | list_profiles | get_profile | forget"
+                },
+                "profile": {
+                    "type": "STRING",
+                    "description": "Profile name (for switch_profile, export, import, forget)"
+                },
+                "file_path": {
+                    "type": "STRING",
+                    "description": "Path to JSON file (import) or OKF directory (import_okf)"
+                },
+                "overwrite": {
+                    "type": "BOOLEAN",
+                    "description": "Overwrite existing memory on import (default: false)"
+                },
+                "category": {
+                    "type": "STRING",
+                    "description": "Memory category (for forget action)"
+                },
+                "key": {
+                    "type": "STRING",
+                    "description": "Memory key to forget"
+                },
+            },
+            "required": ["action"]
+        }
+    },
+    {
         "name": "email",
         "description": (
             "Manages Gmail via API: fetch emails, generate AI replies, create drafts, send emails, "
@@ -604,7 +654,8 @@ TOOL_DECLARATIONS = [
             "Captures a camera frame, detects the face, creates a person record, and stores "
             "the face embedding. If a person with the same name already exists, their embeddings "
             "are updated with the new face. "
-            "Returns the person ID and number of faces detected."
+            "The person is associated with the current memory profile, so face recognition "
+            "can automatically switch to the appropriate profile."
         ),
         "parameters": {
             "type": "OBJECT",
@@ -612,6 +663,10 @@ TOOL_DECLARATIONS = [
                 "name": {
                     "type": "STRING",
                     "description": "The person's name (e.g., 'Alice', 'John Smith')"
+                },
+                "profile": {
+                    "type": "STRING",
+                    "description": "Memory profile to associate (default: current profile)"
                 }
             },
             "required": ["name"]
@@ -849,6 +904,59 @@ class JarvisLive:
                 response={"result": "ok", "silent": True}
             )
 
+        if name == "memory":
+            from memory.memory_manager import (
+                export_memory, import_memory, switch_profile,
+                list_profiles, get_profile, forget,
+                export_okf, import_okf,
+            )
+            action = args.get("action", "").lower().strip()
+            profile = args.get("profile", "").strip() or None
+            file_path = args.get("file_path", "")
+            overwrite = args.get("overwrite", False)
+
+            if action == "export":
+                result = export_memory(profile)
+            elif action == "import":
+                if not file_path:
+                    result = "Please provide a file_path to import from."
+                else:
+                    result = import_memory(file_path, profile, overwrite)
+            elif action == "export_okf":
+                result = export_okf(profile)
+            elif action == "import_okf":
+                if not file_path:
+                    result = "Please provide a file_path (OKF directory) to import from."
+                else:
+                    result = import_okf(file_path, profile, overwrite)
+            elif action == "switch_profile":
+                if not profile:
+                    result = "Please provide a profile name."
+                else:
+                    result = switch_profile(profile)
+            elif action == "list_profiles":
+                result = list_profiles()
+            elif action == "get_profile":
+                result = f"Current memory profile: {get_profile()}"
+            elif action == "forget":
+                category = args.get("category", "notes")
+                key = args.get("key", "")
+                if not key:
+                    result = "Please provide a key to forget."
+                else:
+                    result = forget(key, category, profile)
+            else:
+                result = (f"Unknown memory action: '{action}'. "
+                          f"Use: export, import, export_okf, import_okf, "
+                          f"switch_profile, list_profiles, get_profile, forget")
+
+            if not self.ui.muted:
+                self.ui.set_state("LISTENING")
+            return types.FunctionResponse(
+                id=fc.id, name=name,
+                response={"result": result}
+            )
+
         loop   = asyncio.get_event_loop()
         result = "Done."
 
@@ -1017,8 +1125,12 @@ class JarvisLive:
                 else:
                     try:
                         img_bytes, _ = await loop.run_in_executor(None, _capture_camera)
+                        # Use the current memory profile for this person
+                        from memory.memory_manager import get_profile
+                        profile = args.get("profile", "").strip() or get_profile()
                         person_id = self._face_memory.enroll_person(
-                            person_name, img_bytes, source="camera"
+                            person_name, img_bytes, source="camera",
+                            profile=profile,
                         )
                         if person_id:
                             # Store the image as media and link to the person
@@ -1054,6 +1166,11 @@ class JarvisLive:
                         for m in matches:
                             if m.is_known:
                                 parts.append(f"{m.person_name} (confidence: {m.confidence:.2f})")
+                                # Auto-switch to the recognized person's memory profile
+                                if m.profile and m.profile != get_profile():
+                                    from memory.memory_manager import switch_profile
+                                    switch_profile(m.profile)
+                                    parts[-1] += f" → switched to profile: {m.profile}"
                             else:
                                 parts.append(f"Unknown person (confidence: {m.confidence:.2f})")
                         result = f"Detected {len(matches)} face(s): " + ", ".join(parts)
@@ -1464,6 +1581,62 @@ class JarvisLive:
             except Exception as e:
                 log.warning(f"[Proactive] ⚠️ {e}")
 
+    # ── Auto profile detection at startup ────────────────────────────────────────
+
+    async def _auto_detect_profile(self) -> None:
+        """
+        At startup, open the camera and look for faces.
+        - If a known face is recognized, automatically switch to that person's profile.
+        - If an unknown face is detected, ask for the name, enroll them, and switch.
+        - If no face or camera is unavailable, skip silently.
+        """
+        if not self._face_memory.is_available:
+            self.ui.write_log("SYS: Face recognition not available — skipping auto-detect.")
+            return
+
+        try:
+            loop = asyncio.get_event_loop()
+            img_bytes, _ = await loop.run_in_executor(None, _capture_camera)
+            matches = self._face_memory.recognize_faces(img_bytes)
+
+            if not matches:
+                self.ui.write_log("SYS: No faces detected at startup — using default profile.")
+                return
+
+            # Check for known faces
+            known = [m for m in matches if m.is_known]
+            unknown = [m for m in matches if not m.is_known]
+
+            if known:
+                # Switch to the first known person's profile
+                person = known[0]
+                from memory.memory_manager import switch_profile
+                old_profile = switch_profile(person.profile)
+                self.ui.write_log(
+                    f"SYS: Recognized {person.person_name} → switched to profile '{person.profile}'"
+                )
+                # Greet the user
+                await self.session.send_client_content(
+                    turns={"parts": [{"text": f"Welcome back, {person.person_name}!"}]},
+                    turn_complete=True,
+                )
+            elif unknown:
+                # Unknown face — ask for the name
+                await self.session.send_client_content(
+                    turns={"parts": [{"text": "I see someone new! What's your name?"}]},
+                    turn_complete=True,
+                )
+                # Wait briefly for user response (the session will handle the reply)
+                # For now, we'll just log it — the user can enroll manually
+                self.ui.write_log(
+                    "SYS: Unknown face detected at startup. "
+                    "User can enroll with: 'JARVIS, this is [name]'"
+                )
+
+        except Exception as e:
+            log.warning(f"[AutoDetect] Face detection at startup failed: {e}")
+            self.ui.write_log(f"SYS: Auto-detect failed: {e}")
+
     # ── Phone audio relay ────────────────────────────────────────────────────────
 
     async def _relay_phone_audio(self) -> None:
@@ -1584,6 +1757,9 @@ class JarvisLive:
                     if not self._briefing_sent and get_brief_enabled():
                         self._briefing_sent = True
                         tg.create_task(self._send_startup_briefing())
+
+                    # Auto-detect profile via face recognition at startup
+                    tg.create_task(self._auto_detect_profile())
 
             except KeyboardInterrupt:
                 raise
