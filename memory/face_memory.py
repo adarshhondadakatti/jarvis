@@ -42,6 +42,7 @@ class Person:
     first_seen: str
     last_seen: str
     embedding_count: int = 0
+    profile: str = "default"
     metadata: dict = field(default_factory=dict)
 
 
@@ -52,10 +53,12 @@ class RecognitionResult:
 
     If the face matches a known person, ``person_id`` and ``person_name``
     are set.  If the face is unknown, they are None.
+    ``profile`` is the memory profile associated with the recognized person.
     """
     face: FaceDetection
     person_id: Optional[int] = None
     person_name: Optional[str] = None
+    profile: str = "default"
     confidence: float = 0.0
     is_known: bool = False
 
@@ -125,6 +128,7 @@ class FaceMemory:
         name: str,
         image_bytes: bytes,
         source: str = "camera",
+        profile: str = "default",
     ) -> Optional[int]:
         """
         Enroll a new person by name using a face from the given image.
@@ -143,6 +147,8 @@ class FaceMemory:
             name: The person's name.
             image_bytes: Raw image data (JPEG/PNG) containing a face.
             source: Where the image came from ("camera", "photo", etc.).
+            profile: Memory profile to associate with this person (for
+                     automatic profile switching on recognition).
 
         Returns:
             The new person's ID, or None if no face was found.
@@ -171,20 +177,20 @@ class FaceMemory:
 
                 if existing:
                     person_id = existing[0]
-                    # Update last_seen
+                    # Update last_seen and profile
                     conn.execute(
-                        "UPDATE people SET last_seen = ? WHERE id = ?",
-                        (now, person_id),
+                        "UPDATE people SET last_seen = ?, profile = ? WHERE id = ?",
+                        (now, profile, person_id),
                     )
                 else:
                     # Create new person
                     cur = conn.execute(
                         """
                         INSERT INTO people
-                            (name, first_seen, last_seen, embedding_dim, metadata)
-                        VALUES (?, ?, ?, ?, ?)
+                            (name, first_seen, last_seen, embedding_dim, profile, metadata)
+                        VALUES (?, ?, ?, ?, ?, ?)
                         """,
-                        (name, now, now, backend.embedding_dim, None),
+                        (name, now, now, backend.embedding_dim, profile, None),
                     )
                     person_id = cur.lastrowid
 
@@ -357,7 +363,7 @@ class FaceMemory:
             try:
                 row = conn.execute(
                     """
-                    SELECT p.id, p.name, p.first_seen, p.last_seen,
+                    SELECT p.id, p.name, p.first_seen, p.last_seen, p.profile,
                            COUNT(pe.id) as embedding_count
                     FROM people p
                     LEFT JOIN person_embeddings pe ON pe.person_id = p.id
@@ -378,6 +384,7 @@ class FaceMemory:
             first_seen=row["first_seen"],
             last_seen=row["last_seen"],
             embedding_count=row["embedding_count"],
+            profile=row["profile"] or "default",
         )
 
     # ── Recognition ────────────────────────────────────────────────────────────
@@ -426,6 +433,7 @@ class FaceMemory:
                     if person:
                         result.person_id = person.id
                         result.person_name = person.name
+                        result.profile = person.profile
                         result.confidence = best.similarity
                         result.is_known = True
 

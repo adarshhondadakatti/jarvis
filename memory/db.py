@@ -1,25 +1,19 @@
 """
 SQLite-backed persistent memory store for JARVIS.
 
-Replaces the flat-file JSON approach with a real database so that
-memories survive across sessions, process restarts, and crashes.
+This module provides the database infrastructure for face recognition,
+event memory, media memory, and vector storage.
 
-Schema:
-    memories(category TEXT, key TEXT, value TEXT, updated TEXT,
-             PRIMARY KEY(category, key))
-
-The public API mirrors what memory_manager.py expects:
-    - load_memory()      → dict matching the old JSON structure
-    - save_memory(mem)   → upsert all entries
-    - update_memory(upd) → load → merge → save
-    - forget(key, cat)   → delete one entry
+Text-based memory is now stored in Open Knowledge Format (OKF) — see
+memory_manager.py. The database here is used exclusively for:
+  - Face recognition (people, embeddings)
+  - Event memory (events, event_media, event_people)
+  - Media memory (media, keyframes, detected_objects, detected_people, ocr_text, scene_descriptions)
+  - Vector store (embeddings)
 """
-import json
 import sqlite3
 import sys
-from datetime import datetime
 from pathlib import Path
-from threading import Lock
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 
@@ -31,27 +25,16 @@ def get_base_dir() -> Path:
 
 BASE_DIR     = get_base_dir()
 DB_PATH      = BASE_DIR / "memory" / "jarvis_memory.db"
-JSON_PATH    = BASE_DIR / "memory" / "long_term.json"  # legacy, used for migration
 MEDIA_DIR    = BASE_DIR / "memory" / "storage" / "media"
 
-# ── Constants (mirrors memory_manager) ─────────────────────────────────────────
+_lock = None  # Lazy-initialized
 
-MAX_VALUE_LENGTH = 380
-MEMORY_MAX_CHARS = 2200
-VALID_CATEGORIES = ("identity", "preferences", "projects", "relationships", "wishes", "notes")
-
-_lock = Lock()
-
-
-def _empty_memory() -> dict:
-    return {
-        "identity":      {},
-        "preferences":   {},
-        "projects":      {},
-        "relationships": {},
-        "wishes":        {},
-        "notes":         {},
-    }
+def _get_lock():
+    global _lock
+    if _lock is None:
+        from threading import Lock
+        _lock = Lock()
+    return _lock
 
 
 # ── Connection helper ──────────────────────────────────────────────────────────
@@ -68,27 +51,9 @@ def _connect() -> sqlite3.Connection:
 
 def init_db() -> None:
     """Create the schema if it doesn't exist. Called once at startup."""
-    with _lock:
+    with _get_lock():
         conn = _connect()
         try:
-            # ── Legacy textual memory (unchanged from original schema) ──────────
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS memories (
-                    category   TEXT NOT NULL,
-                    key        TEXT NOT NULL,
-                    value      TEXT NOT NULL,
-                    updated    TEXT NOT NULL,
-                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                    PRIMARY KEY (category, key)
-                )
-                """
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_memories_category "
-                "ON memories(category)"
-            )
-
             # ── People (face memory) ──────────────────────────────────────────
             conn.execute(
                 """
@@ -98,6 +63,7 @@ def init_db() -> None:
                     first_seen    TEXT NOT NULL,
                     last_seen     TEXT NOT NULL,
                     embedding_dim INTEGER NOT NULL,
+                    profile       TEXT DEFAULT 'default',
                     metadata      TEXT,
                     created_at    TEXT NOT NULL DEFAULT (datetime('now'))
                 )
@@ -105,6 +71,9 @@ def init_db() -> None:
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_people_name ON people(name)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_people_profile ON people(profile)"
             )
 
             # ── Person embeddings (multiple per person, float32 BLOBs) ────────
@@ -301,190 +270,12 @@ def init_db() -> None:
             conn.close()
 
 
-# ── Migration: JSON → SQLite (runs once, on first DB startup) ──────────────────
-
-def _migrate_schema_columns(conn: sqlite3.Connection) -> None:
-    """
-    Add new columns to existing tables if they were created before
-    the schema was extended.  Runs on every startup — safe to call
-    repeatedly because we check pragma table_info first.
-    """
-    # memories.created_at
-    cols = [row[1] for row in conn.execute("PRAGMA table_info(memories)").fetchall()]
-    if "created_at" not in cols:
-        # SQLite ALTER TABLE ADD COLUMN doesn't support non-constant defaults,
-        # so we add the column NULLable and back-fill existing rows.
-        conn.execute("ALTER TABLE memories ADD COLUMN created_at TEXT")
-        conn.execute(
-            "UPDATE memories SET created_at = datetime('now') WHERE created_at IS NULL"
-        )
-        print("[Memory] Migrated: added created_at to memories")
-
-
-def _migrate_from_json() -> bool:
-    """
-    If the DB is empty but long_term.json exists, import its contents.
-    Returns True if migration happened.
-    """
-    if not JSON_PATH.exists():
-        return False
-
-    with _lock:
-        conn = _connect()
-        try:
-            _migrate_schema_columns(conn)
-
-            count = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
-            if count > 0:
-                return False  # DB already has data — no migration needed
-
-            try:
-                data = json.loads(JSON_PATH.read_text(encoding="utf-8"))
-            except Exception as e:
-                print(f"[Memory] ⚠️  Migration: could not read JSON: {e}")
-                return False
-
-            if not isinstance(data, dict):
-                return False
-
-            rows = []
-            for cat, items in data.items():
-                if cat not in VALID_CATEGORIES:
-                    continue
-                if not isinstance(items, dict):
-                    continue
-                for key, entry in items.items():
-                    if isinstance(entry, dict) and "value" in entry:
-                        rows.append((
-                            cat,
-                            key,
-                            str(entry["value"]),
-                            entry.get("updated", datetime.now().strftime("%Y-%m-%d")),
-                        ))
-
-            if rows:
-                conn.executemany(
-                    "INSERT OR REPLACE INTO memories (category, key, value, updated) "
-                    "VALUES (?, ?, ?, ?)",
-                    rows,
-                )
-                conn.commit()
-                print(f"[Memory] Migrated {len(rows)} entries from long_term.json")
-            return True
-        finally:
-            conn.close()
-
-
-# ── Core CRUD operations ───────────────────────────────────────────────────────
-
-def db_load_memory() -> dict:
-    """Load all memories from the database into the dict structure."""
-    with _lock:
-        conn = _connect()
-        try:
-            rows = conn.execute(
-                "SELECT category, key, value, updated FROM memories ORDER BY category, key"
-            ).fetchall()
-        finally:
-            conn.close()
-
-    memory = _empty_memory()
-    for row in rows:
-        cat = row["category"]
-        if cat not in memory:
-            continue
-        memory[cat][row["key"]] = {
-            "value": row["value"],
-            "updated": row["updated"],
-        }
-    return memory
-
-
-def db_save_memory(memory: dict) -> None:
-    """
-    Replace all database contents with the given memory dict.
-    Called after trimming to enforce size limits.
-    """
-    if not isinstance(memory, dict):
-        return
-
-    with _lock:
-        conn = _connect()
-        try:
-            conn.execute("DELETE FROM memories")
-            rows = []
-            for cat, items in memory.items():
-                if cat not in VALID_CATEGORIES:
-                    continue
-                if not isinstance(items, dict):
-                    continue
-                for key, entry in items.items():
-                    if isinstance(entry, dict) and "value" in entry:
-                        rows.append((
-                            cat,
-                            key,
-                            str(entry["value"]),
-                            entry.get("updated", datetime.now().strftime("%Y-%m-%d")),
-                        ))
-            if rows:
-                conn.executemany(
-                    "INSERT OR REPLACE INTO memories (category, key, value, updated) "
-                    "VALUES (?, ?, ?, ?)",
-                    rows,
-                )
-            conn.commit()
-        finally:
-            conn.close()
-
-
-def db_upsert(category: str, key: str, value: str, updated: str) -> None:
-    """Insert or update a single memory entry."""
-    with _lock:
-        conn = _connect()
-        try:
-            conn.execute(
-                "INSERT OR REPLACE INTO memories (category, key, value, updated) "
-                "VALUES (?, ?, ?, ?)",
-                (category, key, value, updated),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-
-def db_delete(category: str, key: str) -> bool:
-    """Delete a single memory entry. Returns True if a row was deleted."""
-    with _lock:
-        conn = _connect()
-        try:
-            cur = conn.execute(
-                "DELETE FROM memories WHERE category = ? AND key = ?",
-                (category, key),
-            )
-            conn.commit()
-            return cur.rowcount > 0
-        finally:
-            conn.close()
-
-
-def db_count() -> int:
-    """Return total number of stored memory entries."""
-    with _lock:
-        conn = _connect()
-        try:
-            return conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
-        finally:
-            conn.close()
-
-
 # ── Startup initializer ────────────────────────────────────────────────────────
 
 def ensure_db_ready() -> None:
     """
     Call this at application startup.
-    Creates the schema, migrates any legacy JSON data, and ensures
-    the media storage directory exists.
+    Creates the schema and ensures the media storage directory exists.
     """
     init_db()
-    _migrate_from_json()
     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
