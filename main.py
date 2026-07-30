@@ -888,7 +888,7 @@ class JarvisLive:
                 _cooldown = 4.0  # seconds — covers echo window after speaking ends
                 if self._vision_busy or (_now - self._vision_last_time) < _cooldown:
                     _wait = max(0, _cooldown - (_now - self._vision_last_time))
-                    log.debug(f"[Vision] ⏳ Cooldown active ({_wait:.1f}s remaining) ─ ignoring duplicate call")
+                    log.debug(f"[Vision] ⏳ Cooldown active ({_wait:.1f}s remaining) — ignoring duplicate call")
                     result = "Vision is still processing the previous request. I will not call this again."
                 else:
                     self._vision_busy      = True
@@ -903,7 +903,7 @@ class JarvisLive:
                         _stall = "camera"
                     else:
                         img_b, mime_t = await loop.run_in_executor(None, _capture_screen)
-                        log.debug(f"[Vision] 🖥️ Screen: {len(img_b):,} bytes")
+                        log.debug(f"[Vision] 🖥️  Screen: {len(img_b):,} bytes")
                         _stall = "screen"
                     self._pending_vision = (img_b, mime_t, user_text, angle)
                     result = (
@@ -1233,7 +1233,7 @@ class JarvisLive:
                                 img_b, mime_t, question, angle = self._pending_vision
                                 self._pending_vision = None
                                 b64 = _b64.b64encode(img_b).decode("ascii")
-                                log.debug(f"[Vision] 📤 {len(img_b):,} bytes (angle={angle}) ─ main session")
+                                log.debug(f"[Vision] 📤 {len(img_b):,} bytes (angle={angle}) → main session")
                                 await self.session.send_client_content(
                                     turns={"parts": [
                                         {"inline_data": {"mime_type": mime_t, "data": b64}},
@@ -1317,7 +1317,7 @@ class JarvisLive:
     async def _send_startup_briefing(self) -> None:
         """
         Two-phase briefing optimized for speed:
-          Phase 1 — instant greeting (no tools) ─ speech starts in <1s
+          Phase 1 — instant greeting (no tools) → speech starts in <1s
           Phase 2 — news pre-fetched in a background thread while Phase 1 plays,
                     delivered as ready text (no Gemini tool-call round-trip) and
                     shown on the UI content panel. Waits for turn_complete event
@@ -1600,7 +1600,7 @@ class JarvisLive:
                 print(f"[JARVIS] Error ({type(e).__name__}): {e}")
                 traceback.print_exc()
 
-                # Invalid API key ─ stop hammering the API, prompt re-configuration
+                # Invalid API key — stop hammering the API, prompt re-configuration
                 if "API key not valid" in err_str or "1007" in err_str:
                     self.ui.write_log("ERR: API key invalid — please re-enter your key.")
                     self.ui.set_state("SLEEPING")
