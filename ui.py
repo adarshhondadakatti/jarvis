@@ -1819,6 +1819,8 @@ class MainWindow(QMainWindow):
         self.on_text_command   = None
         self.on_remote_clicked = None   # callable: () -> (url, key) | None
         self.on_interrupt      = None   # callable: () -> None — stop JARVIS mid-speech
+        self.on_toggle_screen_record = None   # callable: () -> str — start/stop screen recording
+        self.on_toggle_meeting_notes = None   # callable: () -> str — start/stop meeting notes
         self._muted            = False
         self._current_file: str | None = None
         self._remote_overlay: RemoteKeyOverlay | None = None
@@ -1953,6 +1955,10 @@ class MainWindow(QMainWindow):
         sc_full.activated.connect(self._toggle_fullscreen)
         sc_intr = QShortcut(QKeySequence("Escape"), self)
         sc_intr.activated.connect(self._do_interrupt)
+        sc_screen_rec = QShortcut(QKeySequence("F8"), self)
+        sc_screen_rec.activated.connect(self._toggle_screen_record_ui)
+        sc_meeting = QShortcut(QKeySequence("F9"), self)
+        sc_meeting.activated.connect(self._toggle_meeting_notes_ui)
 
     def _show_camera_frame(self, img_bytes: bytes):
         """Slot — display camera preview overlay (main thread)."""
@@ -2960,7 +2966,7 @@ class MainWindow(QMainWindow):
             l.setStyleSheet(f"color: {color}; background: transparent;")
             return l
 
-        lay.addWidget(_fl("[F4] Mute  ·  [F11] Fullscreen"))
+        lay.addWidget(_fl("[F4] Mute  ·  [F11] Fullscreen  ·  [F8] Screen Rec  ·  [F9] Meeting Notes"))
         lay.addStretch()
         lay.addWidget(_fl("By FatihMakes", C.PRI_DIM))
         return w
@@ -3259,6 +3265,16 @@ class MainWindow(QMainWindow):
             self._apply_state("LISTENING")
             self._log.append_log("SYS: Microphone active.")
 
+    def _toggle_screen_record_ui(self):
+        if not self.on_toggle_screen_record:
+            return
+        threading.Thread(target=self.on_toggle_screen_record, daemon=True).start()
+
+    def _toggle_meeting_notes_ui(self):
+        if not self.on_toggle_meeting_notes:
+            return
+        threading.Thread(target=self.on_toggle_meeting_notes, daemon=True).start()
+
     def _style_mute_btn(self):
         if self._muted:
             self._mute_btn.setText("🔇  MICROPHONE MUTED")
@@ -3378,6 +3394,22 @@ class JarvisUI:
     @on_interrupt.setter
     def on_interrupt(self, cb):
         self._win.on_interrupt = cb
+
+    @property
+    def on_toggle_screen_record(self):
+        return self._win.on_toggle_screen_record
+
+    @on_toggle_screen_record.setter
+    def on_toggle_screen_record(self, cb):
+        self._win.on_toggle_screen_record = cb
+
+    @property
+    def on_toggle_meeting_notes(self):
+        return self._win.on_toggle_meeting_notes
+
+    @on_toggle_meeting_notes.setter
+    def on_toggle_meeting_notes(self, cb):
+        self._win.on_toggle_meeting_notes = cb
 
     def notify_phone_connected(self) -> None:
         self._win.notify_phone_connected()
