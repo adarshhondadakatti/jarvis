@@ -41,6 +41,7 @@ from ui import JarvisUI
 from memory.memory_manager import (
     load_memory, update_memory, format_memory_for_prompt, init_memory,
 )
+from memory.db import ensure_db_ready
 from memory.face_memory import FaceMemory
 from memory.media_memory import MediaMemory
 from memory.event_memory import EventMemory
@@ -302,11 +303,11 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "file_controller",
-        "description": "Manages files and folders: list, create, delete, move, copy, rename, read, write, find, disk usage.",
+        "description": "Manages files and folders: list, create, delete, move, copy, rename, read, open (in default app), write, find, disk usage.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":      {"type": "STRING", "description": "list | create_file | create_folder | delete | move | copy | rename | read | write | find | largest | disk_usage | organize_desktop | info"},
+                "action":      {"type": "STRING", "description": "list | create_file | create_folder | delete | move | copy | rename | read | open | write | find | largest | disk_usage | organize_desktop | info"},
                 "path":        {"type": "STRING", "description": "File/folder path or shortcut: desktop, downloads, documents, home"},
                 "destination": {"type": "STRING", "description": "Destination path for move/copy"},
                 "new_name":    {"type": "STRING", "description": "New name for rename"},
@@ -466,8 +467,8 @@ TOOL_DECLARATIONS = [
         "Processes any file that the user has uploaded or dropped onto the interface. "
         "Use this when the user refers to an uploaded file and wants an action on it. "
         "Supports: images (describe/ocr/resize/compress/convert), "
-        "PDFs (summarize/extract_text/to_word/summarize_images/extract_images), "
-        "Word docs & text files (summarize/fix/reformat/translate), "
+        "PDFs (open/summarize/extract_text/to_word/summarize_images/extract_images), "
+        "Word docs & text files (open/summarize/fix/reformat/translate), "
         "CSV/Excel (analyze/stats/filter/sort/convert), "
         "JSON/XML (validate/format/analyze), "
         "code files (explain/review/fix/optimize/run/document/test), "
@@ -476,7 +477,8 @@ TOOL_DECLARATIONS = [
         "archives (list/extract), "
         "presentations (summarize/extract_text). "
         "ALWAYS call this tool when a file has been uploaded and the user gives a command about it. "
-        "If the user's command is ambiguous, pick the most logical action for that file type."
+        "If the user's command is ambiguous, pick the most logical action for that file type. "
+        "Use 'open' to read and display file content directly without AI processing."
     ),
     "parameters": {
         "type": "OBJECT",
@@ -489,9 +491,9 @@ TOOL_DECLARATIONS = [
                 "type": "STRING",
                 "description": (
                     "What to do with the file. Examples by type:\n"
-                    "image: describe | ocr | resize | compress | convert | info\n"
-                    "pdf: summarize | extract_text | to_word | info | summarize_images | extract_images\n"
-                    "docx/txt: summarize | fix | reformat | translate_hint | word_count | to_bullet\n"
+                    "image: open | describe | ocr | resize | compress | convert | info\n"
+                    "pdf: open | summarize | extract_text | to_word | info | summarize_images | extract_images\n"
+                    "docx/txt: open | summarize | fix | reformat | translate_hint | word_count | to_bullet\n"
                     "csv/excel: analyze | stats | filter | sort | convert | info\n"
                     "json: validate | format | analyze | to_csv\n"
                     "code: explain | review | fix | optimize | run | document | test\n"
@@ -1170,10 +1172,41 @@ class JarvisLive:
                     result = "I need a name to enroll. Please say 'This is Alice' or similar."
                 else:
                     try:
-                        img_bytes, _ = await loop.run_in_executor(None, _capture_camera)
-                        # Use the current memory profile for this person
-                        from memory.memory_manager import get_profile
-                        profile = args.get("profile", "").strip() or get_profile()
+                        # Prefer the face captured during auto-detect startup if one
+                        # is stashed; otherwise grab a fresh frame from the camera.
+                        if self._pending_face_image is not None:
+                            img_bytes = self._pending_face_image
+                            self._pending_face_image = None
+                            self._awaiting_enrollment = False
+                        else:
+                            img_bytes, _ = await loop.run_in_executor(None, _capture_camera)
+
+                        # Resolve the memory profile for this person:
+                        #  • known name  → switch to that person's existing profile
+                        #  • new name    → create a new profile folder named after them
+                        from memory.memory_manager import (
+                            switch_profile, get_profile, get_profiles,
+                        )
+                        profiles = get_profiles()
+                        existing_person = self._face_memory.find_person_by_name(person_name)
+
+                        if args.get("profile"):
+                            profile = args["profile"].strip()
+                        elif existing_person and existing_person.profile:
+                            # Reuse the profile already attached to this known person
+                            profile = existing_person.profile
+                        else:
+                            # Derive a filesystem-safe profile name from the person's name
+                            slug = re.sub(r"[^a-z0-9]+", "_", person_name.lower()).strip("_")
+                            profile = slug or "default"
+
+                        if profile not in profiles:
+                            # New profile folder — created & activated atomically by switch_profile
+                            switch_profile(profile)
+                        elif profile != get_profile():
+                            # Existing profile — switch to it
+                            switch_profile(profile)
+
                         person_id = self._face_memory.enroll_person(
                             person_name, img_bytes, source="camera",
                             profile=profile,
@@ -1195,9 +1228,16 @@ class JarvisLive:
                             self._event_memory.link_media(event_id, media_id, role="primary")
 
                             emb_count = self._face_memory.count_embeddings()
-                            result = f"Enrolled {person_name} (ID: {person_id}). Face embeddings stored. Total embeddings: {emb_count}."
+                            result = (
+                                f"Enrolled {person_name} (ID: {person_id}). "
+                                f"Face embeddings stored. Total embeddings: {emb_count}. "
+                                f"Memory profile: '{profile}'."
+                            )
                         else:
-                            result = f"I couldn't detect a face in the camera frame. Please make sure you're facing the camera and try again."
+                            result = (
+                                f"I couldn't detect a face in the camera frame. "
+                                f"Please make sure you're facing the camera and try again."
+                            )
                     except Exception as e:
                         result = f"Face enrollment failed: {e}. Make sure insightface is installed."
 
@@ -1289,13 +1329,24 @@ class JarvisLive:
     async def _send_realtime(self):
         while True:
             msg = await self.out_queue.get()
-            await self.session.send_realtime_input(media=msg)
+            # A single failed realtime send (transient API throttle / pipe error)
+            # must NOT tear down the whole TaskGroup and kill the session.
+            # Drop the chunk and keep pumping so Jarvis stays alive.
+            try:
+                await self.session.send_realtime_input(media=msg)
+            except Exception as e:
+                log.warning(f"[JARVIS] ⚠️  send_realtime_input failed — dropped chunk: {e}")
+                print(f"[JARVIS] ⚠️  send_realtime_input failed — dropped chunk: {e}")
 
     async def _listen_audio(self):
         print("[JARVIS] 🎤 Mic started")
         loop = asyncio.get_event_loop()
 
         def callback(indata, frames, time_info, status):
+            if status:
+                # PortAudio reports input overflows here. Surface them instead
+                # of silently dropping audio under noisy conditions.
+                log.warning(f"[JARVIS] 🎤 Mic status: {status}")
             with self._speaking_lock:
                 jarvis_speaking = self._is_speaking
             if not jarvis_speaking and not self.ui.muted and not self._phone_active:
@@ -1642,8 +1693,26 @@ class JarvisLive:
             return
 
         try:
+            # Wait for session to be ready
+            for _ in range(20):  # up to 2 seconds
+                if self.session is not None:
+                    break
+                await asyncio.sleep(0.1)
+
+            if self.session is None:
+                self.ui.write_log("SYS: Session not ready — skipping auto-detect.")
+                return
+
+            # Small delay to ensure session is fully established
+            await asyncio.sleep(0.5)
+
             loop = asyncio.get_event_loop()
             img_bytes, _ = await loop.run_in_executor(None, _capture_camera)
+
+            if not img_bytes:
+                self.ui.write_log("SYS: Camera capture failed — skipping auto-detect.")
+                return
+
             matches = self._face_memory.recognize_faces(img_bytes)
 
             if not matches:
@@ -1658,7 +1727,7 @@ class JarvisLive:
                 # Switch to the first known person's profile
                 person = known[0]
                 from memory.memory_manager import switch_profile
-                old_profile = switch_profile(person.profile)
+                switch_profile(person.profile)
                 self.ui.write_log(
                     f"SYS: Recognized {person.person_name} → switched to profile '{person.profile}'"
                 )
@@ -1668,16 +1737,26 @@ class JarvisLive:
                     turn_complete=True,
                 )
             elif unknown:
-                # Unknown face — ask for the name
+                # Unknown face — stash the captured frame so the upcoming enrollment
+                # reuses the face we just detected (more reliable than re-capturing),
+                # then ask for the name. When the user states it, the model will call
+                # the enroll_person tool, which creates a new profile folder (or
+                # switches to an existing one) and stores the embedding.
+                self._pending_face_image = img_bytes
+                self._awaiting_enrollment = True
                 await self.session.send_client_content(
-                    turns={"parts": [{"text": "I see someone new! What's your name?"}]},
+                    turns={"parts": [{
+                        "text": (
+                            "I see someone I don't know yet. Please tell me your name — "
+                            "for example, 'my name is Alex' or 'this is Alex' — and I'll "
+                            "set up a profile for you and remember your face."
+                        )
+                    }]},
                     turn_complete=True,
                 )
-                # Wait briefly for user response (the session will handle the reply)
-                # For now, we'll just log it — the user can enroll manually
                 self.ui.write_log(
                     "SYS: Unknown face detected at startup. "
-                    "User can enroll with: 'JARVIS, this is [name]'"
+                    "Listening for the user to state their name…"
                 )
 
         except Exception as e:
@@ -1783,6 +1862,8 @@ class JarvisLive:
                     self._vision_busy          = False
                     self._vision_last_time     = 0.0
                     self._interrupted          = False
+                    self._pending_face_image   = None
+                    self._awaiting_enrollment  = False
 
                     print("[JARVIS] Connected.")
                     self.ui.set_state("LISTENING")
@@ -1865,8 +1946,9 @@ def main():
 
     def runner():
         ui.wait_for_api_key()
-        # Initialise persistent memory (creates DB, migrates legacy JSON)
+        # Initialise persistent memory (creates DB schema + OKF dirs)
         init_memory()
+        ensure_db_ready()
         jarvis = JarvisLive(ui)
         try:
             asyncio.run(jarvis.run())

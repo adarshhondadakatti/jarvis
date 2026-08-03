@@ -1,6 +1,7 @@
 import os
 import shutil
 import platform
+import subprocess
 from pathlib import Path
 from datetime import datetime
 
@@ -141,6 +142,29 @@ def _find_file_by_name(name: str, max_depth: int = 3, max_files: int = 5000) -> 
         except (PermissionError, OSError):
             continue
     return None
+
+def _open_file_in_app(path: Path) -> str:
+    """
+    Open a file in its default desktop application.
+    Uses os.startfile() on Windows, 'open' on macOS, 'xdg-open' on Linux.
+    """
+    if not path.exists():
+        return f"File not found: {path.name}"
+    if not path.is_file():
+        return f"Not a file: {path.name}"
+
+    try:
+        if _OS == "Windows":
+            os.startfile(str(path))
+        elif _OS == "Darwin":
+            subprocess.run(["open", str(path)], check=True)
+        else:
+            subprocess.run(["xdg-open", str(path)], check=True)
+        return f"Opened: {path.name}"
+    except FileNotFoundError:
+        return f"No default application found for: {path.name}"
+    except Exception as e:
+        return f"Could not open {path.name}: {e}"
 
 def _resolve_path(raw: str) -> Path:
     shortcuts: dict[str, Path] = {
@@ -591,6 +615,13 @@ def file_controller(
 
         elif action == "read":
             return read_file(path, name=name)
+
+        elif action == "open":
+            base   = _resolve_path(path)
+            target = (base / name) if name else base
+            if not _is_safe_path(target):
+                return f"Access denied: {target}"
+            return _open_file_in_app(target)
 
         elif action == "write":
             return write_file(

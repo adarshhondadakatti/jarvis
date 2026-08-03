@@ -27,7 +27,7 @@ from typing import Optional
 
 import numpy as np
 
-from memory.db import _connect, _lock, MEDIA_DIR
+from memory.db import _connect, _get_lock, MEDIA_DIR
 from memory.vector_store import VectorStore, get_vector_store
 from recognition.face_backend import FaceBackend, FaceDetection, InsightFaceError
 
@@ -167,7 +167,7 @@ class FaceMemory:
 
         now = datetime.now().isoformat()
 
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 # Check if a person with this name already exists
@@ -237,7 +237,7 @@ class FaceMemory:
         added = 0
         now = datetime.now().isoformat()
 
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 for face in faces:
@@ -272,7 +272,7 @@ class FaceMemory:
         Returns:
             True if the person was deleted, False if not found.
         """
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 # Delete embeddings first (FK cascade would handle this,
@@ -289,7 +289,7 @@ class FaceMemory:
 
     def list_people(self) -> list[Person]:
         """Return all known people, sorted by last_seen descending."""
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 rows = conn.execute(
@@ -318,7 +318,7 @@ class FaceMemory:
 
     def get_person(self, person_id: int) -> Optional[Person]:
         """Get a single person by ID."""
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 row = conn.execute(
@@ -358,7 +358,7 @@ class FaceMemory:
 
     def find_person_by_name(self, name: str) -> Optional[Person]:
         """Find a person by name (case-insensitive)."""
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 row = conn.execute(
@@ -447,7 +447,7 @@ class FaceMemory:
                             )
                             # Update last_seen
                             now = datetime.now().isoformat()
-                            with _lock:
+                            with _get_lock():
                                 conn = _connect()
                                 try:
                                     conn.execute(
@@ -476,7 +476,7 @@ class FaceMemory:
             - media_type, file_path, created_at, confidence, bbox
             - keyframe info (if applicable)
         """
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 rows = conn.execute(
@@ -538,7 +538,7 @@ class FaceMemory:
 
     def count_people(self) -> int:
         """Return the total number of known people."""
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 return conn.execute("SELECT COUNT(*) FROM people").fetchone()[0]

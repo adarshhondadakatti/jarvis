@@ -21,7 +21,7 @@ import io
 # Ensure project root is on the path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from memory.db import ensure_db_ready, DB_PATH, MEDIA_DIR, _connect, _lock
+from memory.db import ensure_db_ready, DB_PATH, MEDIA_DIR, _connect, _get_lock
 from memory.vector_store import get_vector_store, reset_vector_store
 from memory.face_memory import FaceMemory
 from memory.media_memory import MediaMemory
@@ -45,7 +45,7 @@ def clean_db():
     reset_vector_store()
 
     # Create a test person (person_id=1) for vector store tests
-    with _lock:
+    with _get_lock():
         conn = _connect()
         try:
             conn.execute(
@@ -128,7 +128,7 @@ class TestVectorStore:
         emb3[2] = 0.01  # Nearly identical to emb1
 
         # Create a second person for person_id=2
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 conn.execute(
@@ -282,7 +282,7 @@ class TestEventMemory:
     def test_link_person(self):
         em = EventMemory()
         # Create a person first
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 conn.execute(
@@ -324,7 +324,7 @@ class TestEventMemory:
         em = EventMemory()
 
         # Create a person
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 conn.execute(
@@ -350,7 +350,7 @@ class TestEventMemory:
     def test_get_last_and_first_event_with_person(self):
         em = EventMemory()
 
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 conn.execute(
@@ -459,7 +459,7 @@ class TestEndToEnd:
         em = EventMemory()
 
         # 1. Create a person
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 conn.execute(
