@@ -29,7 +29,7 @@ from typing import Optional
 
 import numpy as np
 
-from memory.db import DB_PATH, _lock
+from memory.db import DB_PATH, _get_lock
 
 
 # ── Data classes ───────────────────────────────────────────────────────────────
@@ -152,7 +152,7 @@ class SQLiteVectorStore(VectorStore):
         blob = self._array_to_blob(normalized)
         now = datetime.now().isoformat()
 
-        with _lock:
+        with _get_lock():
             conn = self._connect()
             try:
                 cur = conn.execute(
@@ -188,7 +188,7 @@ class SQLiteVectorStore(VectorStore):
 
         query_norm = self._normalize(query)
 
-        with _lock:
+        with _get_lock():
             conn = self._connect()
             try:
                 rows = conn.execute(
@@ -231,7 +231,7 @@ class SQLiteVectorStore(VectorStore):
 
     def delete_for_person(self, person_id: int) -> int:
         """Delete all embeddings for *person_id*."""
-        with _lock:
+        with _get_lock():
             conn = self._connect()
             try:
                 cur = conn.execute(
@@ -245,7 +245,7 @@ class SQLiteVectorStore(VectorStore):
 
     def get_for_person(self, person_id: int) -> list[np.ndarray]:
         """Return all embeddings for *person_id* as numpy arrays."""
-        with _lock:
+        with _get_lock():
             conn = self._connect()
             try:
                 rows = conn.execute(
@@ -259,7 +259,7 @@ class SQLiteVectorStore(VectorStore):
 
     def count(self) -> int:
         """Total number of stored embeddings."""
-        with _lock:
+        with _get_lock():
             conn = self._connect()
             try:
                 return conn.execute(

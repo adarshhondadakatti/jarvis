@@ -85,6 +85,10 @@ def _process_image(path: Path, action: str, params: dict, speak=None) -> str:
 
     action = action or "describe"
 
+    if action == "open":
+        # For images, "open" means describe the image
+        action = "describe"
+
     if action in ("describe", "ocr", "analyze", "read", "extract_text"):
         try:
             model  = _gemini_client()
@@ -289,6 +293,15 @@ def _process_pdf(path: Path, action: str, params: dict, speak=None) -> str:
             pass
         return text[:max_chars] if text else ""
 
+    if action == "open":
+        # Read and return PDF text content
+        text = _extract_pdf_text()
+        if not text.strip():
+            return _summarize_pdf_as_images(path, "summarize", params)
+        if len(text) > 4000:
+            return text[:4000] + f"\n\n[...truncated — {len(text)} total chars]"
+        return text
+
     if action in ("summarize", "extract_text", "translate_hint", "analyze", "reformat"):
         text = _extract_pdf_text()
         if not text.strip():
@@ -483,6 +496,12 @@ def _process_text_doc(path: Path, file_type: str, action: str,
     content = _read_content()
     if not content.strip():
         return "File appears to be empty."
+
+    if action == "open":
+        # Just read and return the file content
+        if len(content) > 4000:
+            return content[:4000] + f"\n\n[...truncated — {len(content)} total chars]"
+        return content
 
     if action == "word_count":
         words = len(content.split())
