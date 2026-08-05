@@ -75,6 +75,7 @@ from actions.game_updater      import game_updater
 from actions.system_monitor    import SystemMonitor, get_system_status
 from actions.proactive         import ProactiveEngine
 from actions.web_search        import _news as _fetch_news_sync
+from actions.meeting_recorder  import MeetingRecorder, ScreenRecorder, _base_dir as _recorder_base_dir
 from memory.config_manager     import (
     get_brief_enabled, get_vad_silence_timeout_ms,
     get_voice, save_voice, normalize_voice, LIVE_VOICES,
@@ -461,6 +462,23 @@ TOOL_DECLARATIONS = [
             "required": ["origin", "destination", "date"]
         }
     },
+        {
+        "name": "meeting_recorder",
+        "description": (
+            "Records the meeting (screen + mic audio) and can summarize it afterward. "
+            "Use for: starting a meeting/screen recording, stopping it, or getting a summary "
+            "of the last recorded meeting."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "start | stop | summarize (default: start)"},
+            },
+            "required": ["action"]
+        }
+    },
+    
+
     {
         "name": "shutdown_jarvis",
         "description": (
@@ -800,8 +818,10 @@ class JarvisLive:
         self._face_memory   = FaceMemory()
         self._media_memory  = MediaMemory()
         self._event_memory  = EventMemory()
-        self._pending_face_image: bytes | None = None  # face stashed by auto-detect for enrollment
-        self._awaiting_enrollment = False
+        # Meeting / screen recording
+        self._meeting_recorder = MeetingRecorder()
+        self._screen_recorder  = ScreenRecorder()
+        self._last_meeting_dir = None
         self._reconnect_requested = False             # set by tools (e.g. set_voice) to force a clean reconnect
 
     def _make_remote_key(self):
@@ -1133,6 +1153,30 @@ class JarvisLive:
             elif name == "flight_finder":
                 r = await loop.run_in_executor(None, lambda: flight_finder(parameters=args, player=self.ui))
                 result = r or "Done."
+                
+            elif name == "meeting_recorder":
+                action = args.get("action", "start")
+                if action in ("start_screen", "start_meeting", "record", "begin"):
+                    action = "start"
+                elif action in ("stop_screen", "stop_meeting", "end"):
+                    action = "stop"
+
+                if action == "start":
+                    session_dir = await loop.run_in_executor(None, self._meeting_recorder.start)
+                    self._last_meeting_dir = session_dir
+                    result = f"Meeting recording started. Saving to {session_dir}."
+                elif action == "stop":
+                    session_dir = await loop.run_in_executor(None, self._meeting_recorder.stop)
+                    self._last_meeting_dir = session_dir
+                    result = "Meeting recording stopped." if session_dir else "No active recording to stop."
+                elif action == "summarize":
+                    if not self._last_meeting_dir:
+                        result = "No recorded meeting found to summarize."
+                    else:
+                        r = await loop.run_in_executor(None, lambda: self._meeting_recorder.summarize(self._last_meeting_dir))
+                        result = r or "Could not generate a summary."
+                else:
+                    result = f"Unknown meeting_recorder action: {action}"
 
             elif name == "email":
                 action = args.get("action", "fetch")
@@ -1387,21 +1431,11 @@ class JarvisLive:
                 jarvis_speaking = self._is_speaking
             if not jarvis_speaking and not self.ui.muted and not self._phone_active:
                 data = indata.tobytes()
-
-                def _enqueue(_data=data):
-                    # Guard against QueueFull: if the server can't keep up with
-                    # the mic, the queue (maxsize=200) would otherwise raise
-                    # asyncio.QueueFull inside the loop thread. Drop the newest
-                    # chunk and keep the stream alive rather than flooding the
-                    # exception handler.
-                    try:
-                        self.out_queue.put_nowait(
-                            {"data": _data, "mime_type": "audio/pcm"}
-                        )
-                    except asyncio.QueueFull:
-                        pass
-
-                loop.call_soon_threadsafe(_enqueue)
+                self._meeting_recorder.feed_audio(data) 
+                loop.call_soon_threadsafe(
+                    self.out_queue.put_nowait,
+                    {"data": data, "mime_type": "audio/pcm"}
+                )
 
         try:
             with sd.InputStream(
