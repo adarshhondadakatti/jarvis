@@ -73,7 +73,7 @@ def set_profile(profile: str) -> str:
     global _current_profile
     old = _current_profile
     _current_profile = profile.strip() or DEFAULT_PROFILE
-    print(f"[Memory] Profile switched: {old} → {_current_profile}")
+    print(f"[Memory] Profile switched: {old} -> {_current_profile}")
     return old
 
 

@@ -34,6 +34,15 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
+# ── Force UTF-8 console output on Windows so emoji / "→" / "—" prints never
+#    crash with UnicodeEncodeError on a default cp1252 terminal. A no-op (or
+#    harmless replace) on terminals that already support UTF-8. ──────────────
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 import sounddevice as sd
 from google import genai
 from google.genai import types
@@ -67,9 +76,11 @@ from actions.system_monitor    import SystemMonitor, get_system_status
 from actions.proactive         import ProactiveEngine
 from actions.web_search        import _news as _fetch_news_sync
 from actions.meeting_recorder  import MeetingRecorder, ScreenRecorder, _base_dir as _recorder_base_dir
-from memory.config_manager     import get_brief_enabled, get_vad_silence_timeout_ms
+from memory.config_manager     import (
+    get_brief_enabled, get_vad_silence_timeout_ms,
+    get_voice, save_voice, normalize_voice, LIVE_VOICES,
+)
 from actions.email             import email_action
-from memory.config_manager     import get_brief_enabled
 
 # ── Ignore warnings ───────────────────────────────────────────────────────────
 os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "0"
@@ -94,6 +105,26 @@ CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE          = 1024
+
+# ── Internal signal used to request a clean reconnect from a tool call ──────────
+
+
+class _RequestReconnect(Exception):
+    """
+    Raised internally (by ``_receive_audio``) to ask the ``run()`` loop for a
+    *clean* reconnect — e.g. after ``set_voice`` needs to rebuild the
+    LiveConnectConfig.  Arrives bundled in a TaskGroup ``BaseExceptionGroup``
+    which ``run()`` unwraps instead of treating as a hard error.
+    """
+
+
+def _unwrap_reconnect(exc: BaseException) -> bool:
+    """True if *exc* is (or is a group containing) a ``_RequestReconnect``."""
+    if isinstance(exc, _RequestReconnect):
+        return True
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_unwrap_reconnect(e) for e in exc.exceptions)
+    return False
 
 def _get_api_key() -> str:
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -726,6 +757,30 @@ TOOL_DECLARATIONS = [
             "required": ["name"]
         }
     },
+    {
+        "name": "set_voice",
+        "description": (
+            "Changes JARVIS's speaking voice (the Gemini Live TTS voice). "
+            "Call when the user asks to change voice or style — e.g. "
+            "'use a deep voice', 'try a female voice', 'switch to Puck', "
+            "'sound more robotic'. The change persists in config and takes "
+            "effect after a brief automatic reconnect."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "voice": {
+                    "type": "STRING",
+                    "description": (
+                        "Voice name. Some options: Charon (deep), Puck (neutral), "
+                        "Kore (warm), Zephyr (bright), Aoede (breezy), Fenrir (excited), "
+                        "Leda (youthful), Erinome (clear), Gacrux (mature)."
+                    )
+                }
+            },
+            "required": ["voice"]
+        }
+    },
 ]
 
 # --- Plugin system ---
@@ -767,6 +822,7 @@ class JarvisLive:
         self._meeting_recorder = MeetingRecorder()
         self._screen_recorder  = ScreenRecorder()
         self._last_meeting_dir = None
+        self._reconnect_requested = False             # set by tools (e.g. set_voice) to force a clean reconnect
 
     def _make_remote_key(self):
         """Called from Qt main thread when user presses Remote Control."""
@@ -881,6 +937,9 @@ class JarvisLive:
         # Increase VAD silence timeout so Jarvis doesn't stop speaking too early.
         # Default server-side is ~2-3 seconds; use config value (default 15000 ms = 15 seconds) for longer responses.
         vad_silence_ms = get_vad_silence_timeout_ms()
+        # Resolve the Gemini Live voice from config (validated against the
+        # supported set; invalid names fall back to "Charon").
+        _voice = normalize_voice(get_voice())
 
         return types.LiveConnectConfig(
             response_modalities=["AUDIO"],
@@ -892,7 +951,7 @@ class JarvisLive:
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name="Charon"
+                        voice_name=_voice
                     )
                 )
             ),
@@ -958,6 +1017,7 @@ class JarvisLive:
                     result = "Please provide a profile name."
                 else:
                     result = switch_profile(profile)
+                    await self._refresh_memory_context()
             elif action == "list_profiles":
                 result = list_profiles()
             elif action == "get_profile":
@@ -1206,6 +1266,7 @@ class JarvisLive:
                         elif profile != get_profile():
                             # Existing profile — switch to it
                             switch_profile(profile)
+                        await self._refresh_memory_context()
 
                         person_id = self._face_memory.enroll_person(
                             person_name, img_bytes, source="camera",
@@ -1256,7 +1317,8 @@ class JarvisLive:
                                 if m.profile and m.profile != get_profile():
                                     from memory.memory_manager import switch_profile
                                     switch_profile(m.profile)
-                                    parts[-1] += f" → switched to profile: {m.profile}"
+                                    await self._refresh_memory_context()
+                                    parts[-1] += f" -> switched to profile: {m.profile}"
                             else:
                                 parts.append(f"Unknown person (confidence: {m.confidence:.2f})")
                         result = f"Detected {len(matches)} face(s): " + ", ".join(parts)
@@ -1295,6 +1357,24 @@ class JarvisLive:
                                 lines.append(f"  - {h['created_at']}: {h['media_type']} (confidence: {h['confidence']:.2f})")
 
                         result = "\n".join(lines)
+
+            elif name == "set_voice":
+                voice = args.get("voice", "").strip()
+                if not voice:
+                    result = "I need a voice name, e.g. Charon, Puck, or Kore."
+                elif normalize_voice(voice) != voice and voice not in LIVE_VOICES:
+                    # Unknown voice — reject with a helpful list instead of
+                    # persisting something the model will reject on connect.
+                    result = (
+                        f"I don't recognize '{voice}'. Try one of: "
+                        + ", ".join(LIVE_VOICES[:9])
+                        + " ..."
+                    )
+                else:
+                    save_voice(normalize_voice(voice))
+                    self._reconnect_requested = True
+                    result = f"Voice set to {normalize_voice(voice)}. Reconnecting to apply."
+                self.ui.write_log(f"SYS: set_voice -> {voice} (pending reconnect)")
 
             elif name == "system_status":
                 r = await loop.run_in_executor(None, get_system_status)
@@ -1481,6 +1561,14 @@ class JarvisLive:
                         await self.session.send_tool_response(
                             function_responses=fn_responses
                         )
+
+                    # A tool (e.g. set_voice) requested a clean reconnect — exit
+                    # the receive loop so the TaskGroup tears down and run()
+                    # rebuilds the session with the new settings.
+                    if self._reconnect_requested:
+                        raise _RequestReconnect
+        except _RequestReconnect:
+            raise
         except Exception as e:
             log.error(f"[JARVIS] ❌ Recv: {e}")
             traceback.print_exc()
@@ -1681,6 +1769,45 @@ class JarvisLive:
 
     # ── Auto profile detection at startup ────────────────────────────────────────
 
+    async def _refresh_memory_context(self) -> None:
+        """
+        Push the currently-active profile's memory into the *active* session.
+
+        The system prompt (built once per connection in ``_build_config``)
+        is baked into the LiveConnectConfig at connect time and cannot be
+        updated mid-session by the Gemini Live API.  So a profile switch
+        that happens after connect — e.g. face-based auto-detect or the
+        ``recognize_person`` tool — would otherwise leave the model
+        answering with the *previous* profile's memory for the rest of the
+        session.  This injects the new profile's facts as interim client
+        content (``turn_complete=False``) so the model sees them immediately.
+        """
+        if not self.session:
+            return
+        try:
+            from memory.memory_manager import get_profile
+            memory = load_memory()
+            mem_str = format_memory_for_prompt(memory, face_memory=self._face_memory)
+            prof = get_profile()
+            if mem_str:
+                text = (
+                    f"[MEMORY CONTEXT] Active profile is now '{prof}'.\n"
+                    f"Use the following facts about the user for the remainder of this session:\n"
+                    f"{mem_str}"
+                )
+            else:
+                text = (
+                    f"[MEMORY CONTEXT] Active profile is now '{prof}'. "
+                    f"This profile has no stored facts yet."
+                )
+            await self.session.send_client_content(
+                turns={"parts": [{"text": text}]},
+                turn_complete=False,
+            )
+            self.ui.write_log(f"SYS: Refreshed in-session memory context -> '{prof}'.")
+        except Exception as e:
+            log.warning(f"[Memory] Could not refresh in-session context: {e}")
+
     async def _auto_detect_profile(self) -> None:
         """
         At startup, open the camera and look for faces.
@@ -1728,8 +1855,9 @@ class JarvisLive:
                 person = known[0]
                 from memory.memory_manager import switch_profile
                 switch_profile(person.profile)
+                await self._refresh_memory_context()
                 self.ui.write_log(
-                    f"SYS: Recognized {person.person_name} → switched to profile '{person.profile}'"
+                    f"SYS: Recognized {person.person_name} -> switched to profile '{person.profile}'"
                 )
                 # Greet the user
                 await self.session.send_client_content(
@@ -1864,6 +1992,7 @@ class JarvisLive:
                     self._interrupted          = False
                     self._pending_face_image   = None
                     self._awaiting_enrollment  = False
+                    self._reconnect_requested = False
 
                     print("[JARVIS] Connected.")
                     self.ui.set_state("LISTENING")
@@ -1894,6 +2023,14 @@ class JarvisLive:
             except SystemExit:
                 raise
             except BaseException as e:
+                # A tool requested a clean reconnect (e.g. set_voice rebuilding
+                # the LiveConnectConfig). run() unwraps it from the TaskGroup's
+                # BaseExceptionGroup and simply reconnects — no error logging.
+                if _unwrap_reconnect(e):
+                    self.ui.write_log("SYS: Reconnecting to apply updated settings (e.g. voice change).")
+                    _conn_backoff = 1
+                    continue
+
                 # Catches both Exception and BaseExceptionGroup (Python 3.11+
                 # TaskGroup raises BaseExceptionGroup when tasks are cancelled
                 # externally, which `except Exception` would miss, letting the

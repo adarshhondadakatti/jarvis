@@ -144,3 +144,48 @@ def save_user_context(context: str) -> None:
             data = {}
     data["user_context"] = context.strip()
     CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+
+# ── Gemini Live voice configuration ────────────────────────────────────────────
+
+# Prebuilt voices supported by gemini-2.5/2.0-flash-live. Full set:
+LIVE_VOICES = (
+    # Deep / authoritative
+    "Charon", "Rasalgethi", "Alnilam", "Pulcherrima",
+    # Neutral / warm / bright
+    "Puck", "Kore", "Zephyr", "Aoede", "Leda",
+    # Casual / character
+    "Fenrir", "Callirrhoe", "Umbriel", "Erinome", "Achird",
+    "Sadaltager", "Vindemiatrix", "Autonoe", "Orus", "Laomedeia",
+    "Sadachbia", "Achernar", "Gacrux", "Zubenelgenubi",
+    "Algieba", "Algenib", "Enceladus", "Iapetus", "Despina",
+    "Schedar", "Sulafat",
+)
+
+
+def normalize_voice(name: str) -> str:
+    """Return a valid voice name (case-insensitive match) or 'Charon' fallback."""
+    if not name:
+        return "Charon"
+    for v in LIVE_VOICES:
+        if v.lower() == name.strip().lower():
+            return v
+    return "Charon"
+
+
+def get_voice() -> str:
+    """Return the configured Gemini Live voice name (default 'Charon')."""
+    return load_api_keys().get("live_voice", "Charon") or "Charon"
+
+
+def save_voice(voice: str) -> None:
+    """Persist the Gemini Live voice name to config."""
+    ensure_config_dir()
+    data: dict = {}
+    if CONFIG_FILE.exists():
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    data["live_voice"] = voice.strip() or "Charon"
+    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
