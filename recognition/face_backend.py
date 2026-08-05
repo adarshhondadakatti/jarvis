@@ -9,7 +9,9 @@ Interface
 ---------
     backend = FaceBackend()
     faces = backend.detect_and_embed(image_bytes)
-    # faces: list[FaceDetection] with .bbox, .confidence, .embedding
+    # faces: list[FaceDetection] with .bbox, .confidence, .embedding,
+    #        .embedding_norm (quality proxy, AdaFace)
+    #        .face_image
 
 The backend is lazily initialised — the InsightFace model is only loaded
 on first use, not at import time.
@@ -42,15 +44,18 @@ class FaceDetection:
     A single detected face.
 
     Attributes:
-        bbox:      Bounding box as (x1, y1, x2, y2) in pixel coordinates.
-        confidence: Detection confidence (0.0 – 1.0).
-        embedding: 512-dim face embedding (float32), or None if not computed.
-        face_image: Cropped face image as numpy array (H, W, 3) RGB, or None.
+        bbox:            Bounding box as (x1, y1, x2, y2) in pixel coordinates.
+        confidence:      Detection confidence (0.0 – 1.0).
+        embedding:       512-dim face embedding (float32), or None if not computed.
+        face_image:      Cropped face image as numpy array (H, W, 3) RGB, or None.
+        embedding_norm:  L2 norm of the raw embedding before normalisation.
+                         Serves as an image-quality proxy (AdaFace).
     """
     bbox: tuple[int, int, int, int]
     confidence: float
     embedding: Optional[np.ndarray] = None
     face_image: Optional[np.ndarray] = None
+    embedding_norm: float = 0.0
 
     @property
     def center(self) -> tuple[float, float]:
@@ -192,6 +197,27 @@ class FaceBackend:
             raise ValueError("No face detected in the cropped image")
         return faces[0].embedding.astype(np.float32)
 
+    def get_embedding_with_norm(self, face_image: np.ndarray) -> tuple[np.ndarray, float]:
+        """
+        Extract a face embedding and its raw L2 norm from a cropped face image.
+
+        The norm of the raw (pre-normalisation) embedding serves as an
+        image-quality proxy, following the AdaFace approach.
+
+        Args:
+            face_image: Cropped face as numpy array (H, W, 3) RGB.
+
+        Returns:
+            Tuple of (512-dim float32 embedding, raw L2 norm).
+        """
+        app = self._ensure_loaded()
+        faces = app.get(face_image)
+        if not faces:
+            raise ValueError("No face detected in the cropped image")
+        embedding = faces[0].embedding.astype(np.float32)
+        norm = float(np.linalg.norm(embedding))
+        return embedding, norm
+
     def detect_and_embed(self, image_bytes: bytes) -> list[FaceDetection]:
         """
         Detect faces and compute embeddings in a single pass.
@@ -221,11 +247,15 @@ class FaceBackend:
             # Crop the face region
             face_img = img[y1:y2, x1:x2].copy() if x2 > x1 and y2 > y1 else None
 
+            embedding = face.embedding.astype(np.float32) if face.embedding is not None else None
+            embedding_norm = float(np.linalg.norm(embedding)) if embedding is not None else 0.0
+
             results.append(FaceDetection(
                 bbox=(int(x1), int(y1), int(x2), int(y2)),
                 confidence=float(face.det_score),
-                embedding=face.embedding.astype(np.float32) if face.embedding is not None else None,
+                embedding=embedding,
                 face_image=face_img,
+                embedding_norm=embedding_norm,
             ))
         return results
 

@@ -6,8 +6,10 @@ Each backend provides a clean interface for a specific recognition task
 extended independently of the memory layer.
 
 Currently available:
-    FaceBackend — InsightFace face detection + embedding extraction
+    FaceBackend      — InsightFace face detection + embedding extraction
+    FaceQuality     — AdaFace-inspired quality assessment and adaptive thresholds
 """
 from recognition.face_backend import FaceBackend, FaceDetection, InsightFaceError
+from recognition.face_quality import FaceQuality
 
-__all__ = ["FaceBackend", "FaceDetection", "InsightFaceError"]
+__all__ = ["FaceBackend", "FaceDetection", "InsightFaceError", "FaceQuality"]

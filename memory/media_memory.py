@@ -32,7 +32,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from memory.db import _connect, _lock, MEDIA_DIR
+from memory.db import _connect, _get_lock, MEDIA_DIR
 
 
 # ── Data classes ───────────────────────────────────────────────────────────────
@@ -170,7 +170,7 @@ class MediaMemory:
         file_path = self._save_image_file(image_bytes, sha)
         now = datetime.now().isoformat()
 
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 # Check for existing media with same SHA256 (deduplication)
@@ -233,7 +233,7 @@ class MediaMemory:
         rel_path = self._save_video_file(src, sha)
         now = datetime.now().isoformat()
 
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 existing = conn.execute(
@@ -279,7 +279,7 @@ class MediaMemory:
         file_path = self._save_keyframe(media_id, image_bytes, media_time)
         now = datetime.now().isoformat()
 
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 cur = conn.execute(
@@ -321,7 +321,7 @@ class MediaMemory:
         bbox_json = json.dumps(bbox) if bbox else None
         now = datetime.now().isoformat()
 
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 cur = conn.execute(
@@ -361,7 +361,7 @@ class MediaMemory:
         bbox_json = json.dumps(bbox) if bbox else None
         now = datetime.now().isoformat()
 
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 cur = conn.execute(
@@ -399,7 +399,7 @@ class MediaMemory:
         bbox_json = json.dumps(bbox) if bbox else None
         now = datetime.now().isoformat()
 
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 cur = conn.execute(
@@ -436,7 +436,7 @@ class MediaMemory:
         """
         now = datetime.now().isoformat()
 
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 cur = conn.execute(
@@ -456,7 +456,7 @@ class MediaMemory:
 
     def get_media(self, media_id: int) -> Optional[MediaRecord]:
         """Get a media record by ID."""
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 row = conn.execute(
@@ -490,7 +490,7 @@ class MediaMemory:
 
     def get_keyframes(self, media_id: int) -> list[KeyframeRecord]:
         """Get all keyframes for a media record."""
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 rows = conn.execute(
@@ -523,7 +523,7 @@ class MediaMemory:
         Returns a list of dicts with media info and detection details,
         sorted by creation date (most recent first).
         """
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 rows = conn.execute(
@@ -556,7 +556,7 @@ class MediaMemory:
         Returns:
             List of dicts with media info and detection details.
         """
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 rows = conn.execute(
@@ -591,7 +591,7 @@ class MediaMemory:
         Returns:
             List of dicts with media info and OCR text.
         """
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 rows = conn.execute(
@@ -652,7 +652,7 @@ class MediaMemory:
         Returns:
             List of dicts with media info.
         """
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 rows = conn.execute(
@@ -728,7 +728,7 @@ class MediaMemory:
         Returns:
             True if the media was deleted, False if not found.
         """
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 # Get the file path before deleting the record
@@ -754,7 +754,7 @@ class MediaMemory:
 
     def count_media(self) -> int:
         """Return the total number of stored media files."""
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 return conn.execute("SELECT COUNT(*) FROM media").fetchone()[0]

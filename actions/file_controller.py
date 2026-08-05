@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import platform
 import subprocess
@@ -142,6 +143,138 @@ def _find_file_by_name(name: str, max_depth: int = 3, max_files: int = 5000) -> 
         except (PermissionError, OSError):
             continue
     return None
+
+
+#: Extensions that are documents worth summarising / reading.
+_DOCUMENT_EXTS = {
+    ".pdf", ".docx", ".doc", ".txt", ".md", ".rst", ".log",
+    ".pptx", ".ppt", ".csv", ".xlsx", ".xls", ".json", ".xml",
+    ".html", ".htm", ".rtf", ".odt",
+}
+
+
+def _score_fuzzy_match(query: str, filename: str) -> float:
+    """Score how well *filename* matches *query* (0 = no match, higher = better).
+
+    The query is typically a keyword the user spoke — e.g. ``"marksheet"``
+    for a file called ``"nandeesh_marksheet.pdf"``.  A substring check is
+    the primary signal; word-boundary alignment, document extension, and
+    filename brevity provide refinements so that among several hits the one
+    the user most likely meant ranks first.
+    """
+    fn_lower = filename.lower()
+    q_lower  = query.lower().strip()
+    if not q_lower:
+        return 0.0
+
+    # Tokenise the query on whitespace / underscore boundaries so that
+    # multi-word queries like "marksheet 2024" are handled gracefully.
+    tokens = [t for t in re.split(r"[\s_]+", q_lower) if t and len(t) >= 2]
+    if not tokens:
+        return 0.0
+
+    # ALL tokens must appear somewhere in the filename — allowing
+    # partial matches causes false positives like "doc" inside "mkdocs".
+    matched = [t for t in tokens if t in fn_lower]
+    if len(matched) != len(tokens):
+        return 0.0
+
+    score = 1.0  # every token matched
+
+    # Bonus when the *entire* query string appears as a substring — this is
+    # the common case ("marksheet" inside "nandeesh_marksheet.pdf").
+    if q_lower in fn_lower:
+        score += 0.5
+
+    # Bonus when a token aligns at a word boundary (preceded or followed by
+    # a non-alphanumeric separator).  ``"marksheet"`` matching
+    # ``_marksheet.`` in ``nandeesh_marksheet.pdf`` gets this; a query
+    # ``"mark"`` matching ``"remarkable.pdf"`` does not.
+    boundary_match = 0
+    for t in tokens:
+        pattern = r"(?:^|[^a-z0-9])" + re.escape(t) + r"(?:[^a-z0-9]|$)"
+        if re.search(pattern, fn_lower):
+            boundary_match += 1
+    score += 0.3 * (boundary_match / len(tokens))
+
+    # Shorter filenames are more likely the intended target.
+    score += 2.0 / (2.0 + len(fn_lower))
+
+    # Boost recognised document extensions.
+    ext = Path(filename).suffix.lower()
+    if ext in _DOCUMENT_EXTS:
+        score += 0.1
+
+    return round(score, 4)
+
+
+def _find_file_fuzzy(
+    query: str,
+    max_results: int = 10,
+    prefer_extensions: set[str] | None = None,
+) -> list[Path]:
+    """Fuzzy file lookup — finds files whose names contain *query*.
+
+    Unlike :func:`_find_file_by_name` (which requires an exact name),
+    this function performs **substring** matching so that a spoken
+    description like ``"marksheet"`` resolves to
+    ``"nandeesh_marksheet.pdf"``.
+
+    Args:
+        query:            A keyword or partial filename to search for.
+        max_results:      Maximum number of candidates to return.
+        prefer_extensions: Set of extensions (e.g. ``{".pdf", ".docx"}``)
+                          to rank higher in the results.
+
+    Returns:
+        List of :class:`~pathlib.Path` objects ranked best-match-first.
+        Empty list when nothing is found.
+    """
+    query = query.strip()
+    if not query:
+        return []
+
+    candidates: list[tuple[float, Path]] = []
+    seen: set[Path] = set()  # de-dup across overlapping search dirs
+
+    for search_dir in _search_dirs():
+        if not search_dir.exists() or not search_dir.is_dir():
+            continue
+        try:
+            for root, dirs, files in os.walk(search_dir):
+                # Depth limit — keep the search fast on large trees.
+                rel   = os.path.relpath(root, str(search_dir))
+                depth = 0 if rel == "." else rel.count(os.sep) + 1
+                if depth >= 2:               # only descend 2 levels
+                    dirs[:] = []
+                    continue
+
+                for fname in files:
+                    score = _score_fuzzy_match(query, fname)
+                    if score <= 0:
+                        continue
+
+                    full_path = Path(root) / fname
+                    resolved = full_path.resolve()
+                    if resolved in seen:
+                        continue
+                    seen.add(resolved)
+
+                    # Apply extension preference.
+                    ext = Path(fname).suffix.lower()
+                    if prefer_extensions is not None and ext in prefer_extensions:
+                        score += 0.2
+
+                    candidates.append((score, full_path))
+        except (PermissionError, OSError):
+            continue
+
+    # Sort: higher score first, then shorter filename, then path string
+    # for deterministic ordering.
+    candidates.sort(key=lambda c: (-c[0], len(c[1].name), str(c[1])))
+
+    return [p for _, p in candidates[:max_results]]
+
 
 def _open_file_in_app(path: Path) -> str:
     """

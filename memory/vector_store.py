@@ -40,6 +40,7 @@ class VectorSearchResult:
     person_id: int
     similarity: float
     embedding_id: int
+    embedding_norm: float = 0.0  # Raw L2 norm of the stored embedding (quality proxy)
 
 
 # ── Abstract base class ────────────────────────────────────────────────────────
@@ -62,6 +63,7 @@ class VectorStore(ABC):
         embedding: np.ndarray,
         source: str = "camera",
         confidence: float = 1.0,
+        embedding_norm: float = 0.0,
     ) -> int:
         """Store an embedding. Returns the row id."""
 
@@ -72,7 +74,12 @@ class VectorStore(ABC):
         top_k: int = 5,
         min_similarity: float = 0.0,
     ) -> list[VectorSearchResult]:
-        """Find the *top_k* nearest embeddings to *query*."""
+        """
+        Find the *top_k* nearest embeddings to *query*.
+
+        Each result includes the stored ``embedding_norm`` so callers
+        can apply quality-adaptive logic (e.g. AdaFace-style weighting).
+        """
 
     @abstractmethod
     def delete_for_person(self, person_id: int) -> int:
@@ -138,12 +145,15 @@ class SQLiteVectorStore(VectorStore):
         embedding: np.ndarray,
         source: str = "camera",
         confidence: float = 1.0,
+        embedding_norm: float = 0.0,
     ) -> int:
         """
         Store an embedding for *person_id*.
 
         The embedding is L2-normalized before storage so that dot-product
-        search is equivalent to cosine similarity.
+        search is equivalent to cosine similarity.  ``embedding_norm``
+        (the raw norm before normalisation) is also stored — it serves
+        as an image-quality proxy following the AdaFace approach.
         """
         if embedding.ndim != 1:
             raise ValueError(f"Expected 1-D embedding, got shape {embedding.shape}")
@@ -158,10 +168,10 @@ class SQLiteVectorStore(VectorStore):
                 cur = conn.execute(
                     """
                     INSERT INTO person_embeddings
-                        (person_id, embedding, source, confidence, created_at)
-                    VALUES (?, ?, ?, ?, ?)
+                        (person_id, embedding, embedding_norm, source, confidence, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (person_id, blob, source, confidence, now),
+                    (person_id, blob, embedding_norm, source, confidence, now),
                 )
                 conn.commit()
                 return cur.lastrowid
@@ -191,8 +201,10 @@ class SQLiteVectorStore(VectorStore):
         with _get_lock():
             conn = self._connect()
             try:
+                # Fetch embedding_norm alongside the embedding so callers
+                # can apply AdaFace-style quality-adaptive logic.
                 rows = conn.execute(
-                    "SELECT id, person_id, embedding FROM person_embeddings"
+                    "SELECT id, person_id, embedding, embedding_norm FROM person_embeddings"
                 ).fetchall()
             finally:
                 conn.close()
@@ -226,6 +238,7 @@ class SQLiteVectorStore(VectorStore):
                 person_id=row["person_id"],
                 similarity=float(similarities[orig_idx]),
                 embedding_id=row["id"],
+                embedding_norm=float(row["embedding_norm"]) if row["embedding_norm"] is not None else 0.0,
             ))
         return results
 

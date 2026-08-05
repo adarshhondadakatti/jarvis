@@ -1031,13 +1031,31 @@ def file_processor(parameters: dict, player=None, speak=None) -> str:
 
     path = Path(file_path_str)
     if not path.exists():
-        # Try to find the file by name in common directories
+        # Phase 1: exact (case-insensitive) name match in common dirs
         from actions.file_controller import _find_file_by_name
         found = _find_file_by_name(file_path_str)
         if found:
             path = found
         else:
-            return f"File not found: {file_path_str}"
+            # Phase 2: fuzzy match — the user may have referred to the file
+            # by a keyword or description rather than its exact name, e.g.
+            # "marksheet" → "nandeesh_marksheet.pdf".
+            from actions.file_controller import _find_file_fuzzy
+            matches = _find_file_fuzzy(file_path_str)
+
+            if len(matches) == 1:
+                path = matches[0]
+            elif len(matches) > 1:
+                listing = "\n".join(f"  • {m.name}" for m in matches[:5])
+                extra = f"\n...and {len(matches) - 5} more" if len(matches) > 5 else ""
+                return (
+                    f"I could not find an exact match for '{file_path_str}', "
+                    f"but I found {len(matches)} similar file(s):\n"
+                    f"{listing}{extra}\n\n"
+                    f"Which one did you mean?"
+                )
+            else:
+                return f"File not found: {file_path_str}"
     if not path.is_file():
         return f"Path is not a file: {file_path_str}"
 
