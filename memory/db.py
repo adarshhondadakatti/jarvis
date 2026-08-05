@@ -77,15 +77,18 @@ def init_db() -> None:
             )
 
             # ── Person embeddings (multiple per person, float32 BLOBs) ────────
+            # embedding_norm stores the raw L2 norm of the pre-normalised embedding,
+            # which serves as an image-quality proxy (AdaFace, CVPR 2022).
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS person_embeddings (
-                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                    person_id  INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
-                    embedding  BLOB NOT NULL,
-                    source     TEXT,
-                    confidence REAL,
-                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    person_id       INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+                    embedding       BLOB NOT NULL,
+                    embedding_norm  REAL DEFAULT 0.0,
+                    source          TEXT,
+                    confidence      REAL,
+                    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
                 )
                 """
             )
@@ -95,6 +98,13 @@ def init_db() -> None:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_pe_created ON person_embeddings(created_at)"
             )
+
+            # ── Backward-compatible migration for existing databases ─────────
+            # Add embedding_norm column if it doesn't exist (older schemas).
+            cols = [row[1] for row in conn.execute("PRAGMA table_info(person_embeddings)").fetchall()]
+            if "embedding_norm" not in cols:
+                conn.execute("ALTER TABLE person_embeddings ADD COLUMN embedding_norm REAL DEFAULT 0.0")
+            # ────────────────────────────────────────────────────────────────
 
             # ── Media files (images, videos, clips, frames) ──────────────────
             conn.execute(

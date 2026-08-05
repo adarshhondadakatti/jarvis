@@ -485,7 +485,13 @@ TOOL_DECLARATIONS = [
         "properties": {
             "file_path": {
                 "type": "STRING",
-                "description": "Full path to the uploaded file. Leave empty to use the currently uploaded file."
+                "description": (
+                    "Path to the file. Can be a full path, an exact filename, "
+                    "or even a partial name / description (e.g. 'marksheet' for "
+                    "'nandeesh_marksheet.pdf') — the tool fuzzy-matches if an "
+                    "exact path is not found. Leave empty to use the currently "
+                    "uploaded file."
+                )
             },
             "action": {
                 "type": "STRING",
@@ -1342,11 +1348,23 @@ class JarvisLive:
         print("[JARVIS] 🎤 Mic started")
         loop = asyncio.get_event_loop()
 
+        _last_overflow_ts = 0.0  # rate-limit benign overflow logs to once per 5 s
+
         def callback(indata, frames, time_info, status):
+            nonlocal _last_overflow_ts
             if status:
-                # PortAudio reports input overflows here. Surface them instead
-                # of silently dropping audio under noisy conditions.
-                log.warning(f"[JARVIS] 🎤 Mic status: {status}")
+                # input_overflow is benign & frequent (GC pauses, brief callback
+                # stalls under load).  Rate-limit it to DEBUG so the logs
+                # aren't flooded with "input overflow" warnings.
+                if status.input_overflow:
+                    now = time.monotonic()
+                    if now - _last_overflow_ts >= 5.0:
+                        log.debug("[JARVIS] 🎤 Mic input overflow (benign, rate-limited)")
+                        _last_overflow_ts = now
+                else:
+                    # All other flags (host errors, device disconnects, etc.)
+                    # are genuine problems — surface as WARNING.
+                    log.warning(f"[JARVIS] 🎤 Mic status: {status}")
             with self._speaking_lock:
                 jarvis_speaking = self._is_speaking
             if not jarvis_speaking and not self.ui.muted and not self._phone_active:
