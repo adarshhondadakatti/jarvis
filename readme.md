@@ -41,6 +41,9 @@ MARK XLIX deepens the personal assistant foundation. Rather than adding more too
 | 🌐 Browser Control | Open URLs, navigate tabs, and interact with the browser by voice |
 | 📨 Send Message | Compose and send messages through WhatsApp, Telegram, and more |
 | 📧 Email | Gmail API integration: fetch unread emails, AI-generated draft replies, human review |
+| 📅 Calendar | Google Calendar API integration: list events, create/update/cancel meetings, free/busy lookup, optional Meet link |
+| 👥 Teams Calendar | Microsoft Graph API integration: list events, create/update/cancel meetings, free/busy lookup, optional Teams meeting link |
+| 🗓️ Meeting Scheduler | Unified scheduling across Google/Teams calendars: auto provider selection, auto free-slot search, merged "what's on my calendar" view |
 | 🎬 YouTube Control | Search, play, and control YouTube playback by voice |
 | 🖱️ Desktop Control | Taskbar, window management, and desktop-level operations |
 | 🧑‍💻 Silent Language Memory | Detects spoken language on first use and saves it — all future sessions adapt automatically |
@@ -130,7 +133,10 @@ Mark XLIX/
 │   ├── dev_agent.py         # Developer task agent
 │   ├── desktop.py           # Desktop and taskbar control
 │   ├── proactive.py         # Proactive silence-break suggestions
-│   └── email.py             # Gmail API: fetch, AI replies, draft creation
+│   ├── email.py             # Gmail API: fetch, AI replies, draft creation
+│   ├── calendar_google.py   # Google Calendar API: list/create/update/delete events, free/busy
+│   ├── calendar_teams.py    # Microsoft Graph API: list/create/update/delete events, free/busy, Teams links
+│   └── meeting_scheduler.py # Unified scheduler: provider auto-resolve, free-slot search, merged calendar view
 ├── memory/                  # Persistent memory system (SQLite + JSON)
 │   ├── db.py                # SQLite schema, CRUD, migrations
 │   ├── memory_manager.py    # Textual memory API (load/save/update/forget)
@@ -285,6 +291,90 @@ To enable the Email module, you need to configure Gmail API access:
 
 > ⚠️ **Security**: Emails are fetched via Gmail API (no browser automation). Drafts are created for your review — nothing is sent automatically.
 ```
+
+---
+
+## 📅 Google Calendar Setup
+
+The Calendar module reuses the same OAuth client as Gmail — if you've already done the Gmail setup above, you only need step 2 below.
+
+1. **Go to Google Cloud Console**: https://console.cloud.google.com/ (same project as Gmail)
+
+2. **Enable the Calendar API**:
+   - APIs & Services → Library → Search "Google Calendar API" → Enable
+
+3. **Reuse (or create) OAuth credentials**: if `config/gmail_credentials.json` already exists from the Gmail setup, no action needed — Calendar authenticates separately (its own token file) but shares the same OAuth client.
+
+4. **First run**: Say "JARVIS, what's on my calendar" or use the `calendar_google` tool with `action: auth`. A browser window will open for Google OAuth consent (separate consent screen from Gmail, since the scope is different). Tokens are stored in `config/gcal_token.json`.
+
+### Calendar Commands
+- **"What's on my calendar today"** — List upcoming events
+- **"Schedule a meeting with [name] tomorrow at 3pm"** — Create an event
+- **"Add a Google Meet link to that"** — Create an event with `add_meet_link: true`
+- **"Cancel my 3pm meeting"** — Delete an event
+- **"Calendar status"** — Check authentication status
+
+> ⚠️ Attendees are invited via calendar invite email (`sendUpdates: all`) when the event has attendees — nothing is sent silently.
+
+---
+
+## 👥 Microsoft Teams Calendar Setup
+
+The Teams Calendar module talks to Microsoft 365 / Outlook via the Microsoft Graph API. Unlike Gmail/Google Calendar, it needs its own Azure app registration.
+
+1. **Go to the Azure Portal**: https://portal.azure.com/ → Entra ID → App registrations → New registration
+   - Supported account types: **Accounts in this organizational directory only** (single tenant) — a tenant admin must grant consent in step 3.
+   - Redirect URI: leave blank here.
+
+2. **Enable public client flows**:
+   - App registration → Authentication → Add a platform → **Mobile and desktop applications** → check `http://localhost`
+   - Set **Allow public client flows** to **Yes**
+
+3. **Add API permissions** (App registration → API permissions → Add a permission → Microsoft Graph → Delegated permissions):
+   - `Calendars.ReadWrite`
+   - `User.Read`
+   - `OnlineMeetings.ReadWrite`
+   - Click **Grant admin consent for [tenant]** (requires a tenant admin)
+
+4. **Copy your IDs** from the app's Overview page: **Application (client) ID** and **Directory (tenant) ID**
+
+5. **Add to config/api_keys.json**:
+   ```json
+   {
+     "ms_client_id": "your-application-client-id",
+     "ms_tenant_id": "your-directory-tenant-id"
+   }
+   ```
+
+6. **First run**: Say "JARVIS, Teams calendar status" or use the `calendar_teams` tool with `action: auth`. A browser window opens for Microsoft sign-in/consent. Tokens are cached in `config/msgraph_token_cache.json`.
+
+### Teams Calendar Commands
+- **"What's on my Teams calendar today"** — List upcoming events
+- **"Schedule a Teams meeting with [name] tomorrow at 2pm"** — Create an event with a Teams join link (`is_teams_meeting: true`)
+- **"Cancel my 2pm Teams meeting"** — Delete an event
+- **"Teams calendar status"** — Check authentication status
+
+> ⚠️ **Admin consent**: if the tenant admin hasn't granted consent for the requested permissions, sign-in will fail with an `AADSTS65001` error. Have your Azure admin grant consent from the app registration's API permissions page.
+
+---
+
+## 🗓️ Meeting Scheduler (Unified)
+
+`meeting_scheduler` sits on top of Google Calendar and Teams Calendar so you don't have to say which one — it picks a provider automatically and, when you don't give an exact time, finds the next open slot itself.
+
+- **Provider resolution**: explicit request > `calendar_provider_default` in `config/api_keys.json` (`"google"` or `"teams"`) > whichever single provider is configured > Google as a last-resort tie-break when both are set up.
+- **Auto slot-finding**: if you don't name a time, it searches business hours (09:00–18:00 UTC) up to 5 days ahead on the resolved provider's calendar for the first gap that fits the requested duration.
+- **Merged listing**: "what's on my calendar" pulls from every configured provider and sorts them together, each tagged 🟦 (Google) or 🟪 (Teams).
+- **Composite IDs**: list results carry an id like `google:abc123` or `teams:xyz789` — pass that straight back to cancel or reschedule that specific meeting.
+
+### Meeting Scheduler Commands
+- **"What's on my calendar today"** — merged view across both providers
+- **"Schedule a 30-minute meeting with [name] tomorrow"** — auto-finds a free slot, no time needed
+- **"Set up a call with [name] at 2pm on Friday"** — exact time, provider auto-resolved
+- **"Cancel my meeting with [name]"** — uses the composite id from a prior list
+- **"Move my 2pm to 4pm"** — reschedule
+
+> ⚠️ Auto slot-finding checks the organizer's own calendar (and, for Teams, any attendees in the same tenant via `getSchedule`). It does not see personal Google calendars of external attendees — those recipients get invited via email and can propose a new time themselves.
 
 ---
 

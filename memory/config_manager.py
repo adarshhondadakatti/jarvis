@@ -173,6 +173,49 @@ def normalize_voice(name: str) -> str:
     return "Charon"
 
 
+def get_ms_client_id() -> str:
+    """Return the Azure AD app registration client (application) ID for Microsoft Graph."""
+    return load_api_keys().get("ms_client_id", "")
+
+
+def get_ms_tenant_id() -> str:
+    """Return the Azure AD tenant ID. Defaults to 'organizations' (any work/school tenant)."""
+    return load_api_keys().get("ms_tenant_id", "") or "organizations"
+
+
+def save_ms_app_config(client_id: str, tenant_id: str = "") -> None:
+    """Persist Azure AD app registration details for Microsoft Graph (Teams Calendar)."""
+    ensure_config_dir()
+    data: dict = {}
+    if CONFIG_FILE.exists():
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    data["ms_client_id"] = client_id.strip()
+    data["ms_tenant_id"] = tenant_id.strip()
+    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+
+def get_calendar_provider_default() -> str:
+    """Return the preferred calendar provider ('google' | 'teams') for meeting_scheduler
+    when the user doesn't specify one. Empty string means auto-detect."""
+    return load_api_keys().get("calendar_provider_default", "")
+
+
+def save_calendar_provider_default(provider: str) -> None:
+    """Persist the preferred default calendar provider."""
+    ensure_config_dir()
+    data: dict = {}
+    if CONFIG_FILE.exists():
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    data["calendar_provider_default"] = provider.strip().lower()
+    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+
 def get_voice() -> str:
     """Return the configured Gemini Live voice name (default 'Charon')."""
     return load_api_keys().get("live_voice", "Charon") or "Charon"

@@ -81,6 +81,9 @@ from memory.config_manager     import (
     get_voice, save_voice, normalize_voice, LIVE_VOICES,
 )
 from actions.email             import email_action
+from actions.calendar_google   import calendar_google_action
+from actions.calendar_teams    import calendar_teams_action
+from actions.meeting_scheduler import meeting_scheduler_action
 
 # ── Ignore warnings ───────────────────────────────────────────────────────────
 os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "0"
@@ -704,6 +707,120 @@ TOOL_DECLARATIONS = [
         }
     },
     {
+        "name": "calendar_google",
+        "description": (
+            "Manages Google Calendar via API: list upcoming events, create/update/delete events, "
+            "check free/busy time. Use start_time/end_time as ISO 8601 datetimes with a UTC offset "
+            "(e.g. '2026-09-19T15:00:00+05:30'). Actions: list, create, update, delete, freebusy, "
+            "auth (re-authenticate), status (check auth)."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {
+                    "type": "STRING",
+                    "description": "list | create | update | delete | freebusy | auth | status",
+                },
+                "summary": {"type": "STRING", "description": "Event title (create/update)"},
+                "start_time": {"type": "STRING", "description": "ISO 8601 datetime with UTC offset (create/update)"},
+                "end_time": {"type": "STRING", "description": "ISO 8601 datetime with UTC offset (create/update)"},
+                "description": {"type": "STRING", "description": "Event notes/body (create/update)"},
+                "location": {"type": "STRING", "description": "Event location or meeting room (create/update)"},
+                "attendees": {
+                    "type": "ARRAY",
+                    "items": {"type": "STRING"},
+                    "description": "Attendee email addresses (create/update)",
+                },
+                "add_meet_link": {"type": "BOOLEAN", "description": "Attach a Google Meet link (create only)"},
+                "event_id": {"type": "STRING", "description": "Event ID (update/delete)"},
+                "time_min": {"type": "STRING", "description": "ISO 8601 datetime with UTC offset (list/freebusy)"},
+                "time_max": {"type": "STRING", "description": "ISO 8601 datetime with UTC offset (list/freebusy)"},
+                "max_results": {"type": "INTEGER", "description": "Max events to list (default: 10)"},
+                "query": {"type": "STRING", "description": "Free-text search filter (list only)"},
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "calendar_teams",
+        "description": (
+            "Manages Microsoft 365 / Outlook Calendar via Graph API: list upcoming events, "
+            "create/update/delete events, check free/busy time for yourself or attendees. "
+            "Set is_teams_meeting=true when creating an event to attach an auto-generated "
+            "Microsoft Teams join link. Use start_time/end_time as ISO 8601 datetimes with a "
+            "UTC offset (e.g. '2026-09-22T15:00:00+05:30'). Actions: list, create, update, "
+            "delete, freebusy, auth (re-authenticate), status (check auth)."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {
+                    "type": "STRING",
+                    "description": "list | create | update | delete | freebusy | auth | status",
+                },
+                "summary": {"type": "STRING", "description": "Event title (create/update)"},
+                "start_time": {"type": "STRING", "description": "ISO 8601 datetime with UTC offset (create/update)"},
+                "end_time": {"type": "STRING", "description": "ISO 8601 datetime with UTC offset (create/update)"},
+                "description": {"type": "STRING", "description": "Event notes/body (create/update)"},
+                "location": {"type": "STRING", "description": "Event location or meeting room (create/update)"},
+                "attendees": {
+                    "type": "ARRAY",
+                    "items": {"type": "STRING"},
+                    "description": "Attendee email addresses (create/update/freebusy)",
+                },
+                "is_teams_meeting": {"type": "BOOLEAN", "description": "Attach a Microsoft Teams join link (create only)"},
+                "event_id": {"type": "STRING", "description": "Event ID (update/delete)"},
+                "time_min": {"type": "STRING", "description": "ISO 8601 datetime with UTC offset (list/freebusy)"},
+                "time_max": {"type": "STRING", "description": "ISO 8601 datetime with UTC offset (list/freebusy)"},
+                "max_results": {"type": "INTEGER", "description": "Max events to list (default: 10)"},
+                "query": {"type": "STRING", "description": "Free-text search filter (list only)"},
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "meeting_scheduler",
+        "description": (
+            "Unified meeting scheduling across Google Calendar and Teams Calendar. Prefer this "
+            "tool over calling calendar_google/calendar_teams directly for natural-language "
+            "requests like 'schedule a meeting with X tomorrow', 'what's on my calendar', "
+            "'cancel my 3pm', or 'move my meeting to 4pm'. If start_time is omitted on 'schedule', "
+            "it automatically finds the next free slot of duration_min minutes within business "
+            "hours. 'list' merges events from every configured provider, each tagged with a "
+            "composite id like 'google:abc123' or 'teams:xyz789' — pass that id back for cancel/"
+            "reschedule. Use start_time/end_time as ISO 8601 datetimes with a UTC offset."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {
+                    "type": "STRING",
+                    "description": "schedule | list | cancel | reschedule",
+                },
+                "title": {"type": "STRING", "description": "Meeting title (schedule)"},
+                "duration_min": {"type": "INTEGER", "description": "Meeting length in minutes (default: 30)"},
+                "attendees": {
+                    "type": "ARRAY",
+                    "items": {"type": "STRING"},
+                    "description": "Attendee email addresses (schedule)",
+                },
+                "start_time": {"type": "STRING", "description": "ISO 8601 datetime with UTC offset — exact start (schedule/reschedule)"},
+                "end_time": {"type": "STRING", "description": "ISO 8601 datetime with UTC offset (schedule/reschedule)"},
+                "earliest_start": {"type": "STRING", "description": "ISO 8601 datetime with UTC offset — earliest allowed auto-found start (schedule, only used when start_time is omitted)"},
+                "provider": {"type": "STRING", "description": "google | teams (omit to auto-resolve)"},
+                "description": {"type": "STRING", "description": "Meeting notes/agenda (schedule)"},
+                "location": {"type": "STRING", "description": "Physical location or meeting room (schedule)"},
+                "video_link": {"type": "BOOLEAN", "description": "Attach a video call link (default: true) (schedule)"},
+                "search_days": {"type": "INTEGER", "description": "Days ahead to search for a free slot (default: 5) (schedule)"},
+                "event_id": {"type": "STRING", "description": "Composite id 'provider:id' from a list result (cancel/reschedule)"},
+                "time_min": {"type": "STRING", "description": "ISO 8601 datetime with UTC offset (list)"},
+                "time_max": {"type": "STRING", "description": "ISO 8601 datetime with UTC offset (list)"},
+                "max_results": {"type": "INTEGER", "description": "Max meetings to list (default: 10)"},
+            },
+            "required": ["action"]
+        }
+    },
+    {
         "name": "enroll_person",
         "description": (
             "Enroll a new person into face memory by name. "
@@ -1231,6 +1348,27 @@ class JarvisLive:
                         )
                     )
                     result = r or "Done."
+
+            elif name == "calendar_google":
+                r = await loop.run_in_executor(
+                    None,
+                    lambda: calendar_google_action(parameters=args, player=self.ui)
+                )
+                result = r or "Done."
+
+            elif name == "calendar_teams":
+                r = await loop.run_in_executor(
+                    None,
+                    lambda: calendar_teams_action(parameters=args, player=self.ui)
+                )
+                result = r or "Done."
+
+            elif name == "meeting_scheduler":
+                r = await loop.run_in_executor(
+                    None,
+                    lambda: meeting_scheduler_action(parameters=args, player=self.ui)
+                )
+                result = r or "Done."
 
             elif name == "enroll_person":
                 person_name = args.get("name", "").strip()
