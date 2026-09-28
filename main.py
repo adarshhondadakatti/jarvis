@@ -1,5 +1,8 @@
+from email.mime import text
 import platform as _platform
 import subprocess as _subprocess
+# pyrefly: ignore [missing-import]
+
 
 # ── Nuclear: force CREATE_NO_WINDOW on EVERY subprocess call on Windows ───────
 # This patches Popen itself, so no per-file flag is needed anywhere.
@@ -18,7 +21,7 @@ if _platform.system() == "Windows":
 import os
 import asyncio
 import re
-import threading
+import threading 
 import time
 import json
 import sys
@@ -26,16 +29,29 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
+if _platform.system() == "Windows":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    
+def _global_excepthook(exc_type, exc_value, exc_tb):
+    traceback.print_exception(exc_type, exc_value, exc_tb)
+    print(f"[JARVIS] Uncaught exception (recovered): {exc_value}")
+
+sys.excepthook = _global_excepthook
+
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="sounddevice")
 import sounddevice as sd
 from google import genai
 from google.genai import types
-from ui import JarvisUI
 from memory.memory_manager import (
     load_memory, update_memory, format_memory_for_prompt, init_memory,
 )
 from memory.face_memory import FaceMemory
 from memory.media_memory import MediaMemory
 from memory.event_memory import EventMemory
+from memory.okf_memory import get_okf_manager, synchronize_memory
+from memory.semantic_memory import search as recall_search
 
 from actions.file_processor import file_processor
 from actions.flight_finder     import flight_finder
@@ -60,7 +76,9 @@ from actions.web_search        import _news as _fetch_news_sync
 from actions.meeting_recorder  import MeetingRecorder, ScreenRecorder, _base_dir as _recorder_base_dir
 from memory.config_manager     import get_brief_enabled, get_vad_silence_timeout_ms
 from actions.email             import email_action
+from core.tool_resilience      import run_resilient, ToolError,ToolTimeout, ConfirmationGate
 from memory.config_manager     import get_brief_enabled
+
 
 # ── Ignore warnings ───────────────────────────────────────────────────────────
 os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "0"
@@ -69,7 +87,6 @@ os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "0"
 from core.logging_config import setup_logging, get_logger
 setup_logging()
 log = get_logger(__name__)
-
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -90,7 +107,6 @@ def _get_api_key() -> str:
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)["gemini_api_key"]
 
-
 def _load_system_prompt() -> str:
     try:
         return PROMPT_PATH.read_text(encoding="utf-8")
@@ -100,7 +116,6 @@ def _load_system_prompt() -> str:
             "Be concise, direct, and always use the provided tools to complete tasks. "
             "Never simulate or guess results — always call the appropriate tool."
         )
-
 _CTRL_RE = re.compile(r"<ctrl\d+>", re.IGNORECASE)
 
 def _clean_transcript(text: str) -> str:    
@@ -164,7 +179,7 @@ TOOL_DECLARATIONS = [
         "description": "Gives the weather report to user",
         "parameters": {
             "type": "OBJECT",
-            "properties": {
+            "properties": { 
                 "city": {"type": "STRING", "description": "City name"}
             },
             "required": ["city"]
@@ -306,6 +321,7 @@ TOOL_DECLARATIONS = [
                 "name":        {"type": "STRING", "description": "File name to search for"},
                 "extension":   {"type": "STRING", "description": "File extension to search (e.g. .pdf)"},
                 "count":       {"type": "INTEGER", "description": "Number of results for largest"},
+                "confirmed":   {"type": "BOOLEAN", "description": "For delete/move only: set true ONLY after the user has explicitly said yes to a confirmation question you already asked them."},
             },
             "required": ["action"]
         }
@@ -430,15 +446,13 @@ TOOL_DECLARATIONS = [
             "of the last recorded meeting."
         ),
         "parameters": {
-            "type": "OBJECT",
+            "type": "OBJECT", 
             "properties": {
                 "action": {"type": "STRING", "description": "start | stop | summarize (default: start)"},
             },
             "required": ["action"]
         }
     },
-    
-
     {
         "name": "shutdown_jarvis",
         "description": (
@@ -449,7 +463,28 @@ TOOL_DECLARATIONS = [
         ),
         "parameters": {
             "type": "OBJECT",
-            "properties": {},
+            "properties": {"confirmed": {"type": "BOOLEAN", "description": "Set true ONLY after the user has explicitly confirmed they want to shut down, in response to a confirmation question you already asked."},
+            },
+        }
+    },
+    
+    {
+        "name": "recall_memory",
+        "description": (
+            "Searches Jarvis's long-term memory (personal facts, preferences, past meeting "
+            "summaries, and past events) for anything relevant that isn't already visible in "
+            "the current context. Use this BEFORE saying you don't know or don't remember "
+            "something the user references — a past decision, a project detail, something "
+            "mentioned in an earlier meeting, etc. Do not use this for things already covered "
+            "by [WHAT YOU KNOW ABOUT THIS PERSON] in your system prompt."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "query":  {"type": "STRING", "description": "What to search for, in natural language (e.g. 'what did we decide about the API redesign')"},
+                "top_k":  {"type": "INTEGER", "description": "Max results to return (default 5)"},
+            },
+            "required": ["query"]
         }
     },
     {
@@ -610,6 +645,10 @@ TOOL_DECLARATIONS = [
                     "type": "BOOLEAN",
                     "description": "Mark emails as read after processing (default: true)"
                 },
+                "confirmed": {
+                    "type": "BOOLEAN",
+                    "description": "For send/reply only: set true ONLY after the user has explicitly confirmed the recipient and content, in response to a confirmation question you already asked."
+                },
             },
             "required": ["action"]
         }
@@ -670,13 +709,10 @@ TOOL_DECLARATIONS = [
         }
     },
 ]
-
 # --- Plugin system ---
-
-
 class JarvisLive:
 
-    def __init__(self, ui: JarvisUI):
+    def __init__(self, ui):
         self.ui             = ui
         self._asst_name     = "JARVIS"   # updated each session from config
         self.session              = None
@@ -710,7 +746,13 @@ class JarvisLive:
         self._meeting_recorder = MeetingRecorder()
         self._screen_recorder  = ScreenRecorder()
         self._last_meeting_dir = None
+        self._confirm_gate = ConfirmationGate()
 
+        # GitHub MCP — populated by run() at startup (async fetch there);
+        # defaults to [] here so _build_config() has something to read from
+        # even if called before run() finishes discovery.
+        self._github_tool_declarations = []
+       
     def _make_remote_key(self):
         """Called from Qt main thread when user presses Remote Control."""
         if self._dashboard is None:
@@ -725,15 +767,28 @@ class JarvisLive:
         return url, key, f"{url}/auto-login?key={key}", manual
 
     def _on_text_command(self, text: str):
+        print(f"[JARVIS] 📝 _on_text_command called: {text!r} | loop={bool(self._loop)} session={bool(self.session)}")
         if not self._loop or not self.session:
+            self.ui.write_log("SYS: Not connected yet — command dropped. Please wait and retry.")
+            print("[JARVIS] ⚠️ Dropped text command — no active session/loop.")
             return
-        asyncio.run_coroutine_threadsafe(
+        future = asyncio.run_coroutine_threadsafe(
             self.session.send_client_content(
                 turns={"parts": [{"text": text}]},
                 turn_complete=True
             ),
             self._loop
         )
+
+        def _log_result(fut):
+            try:
+                fut.result()
+                print(f"[JARVIS] ✅ send_client_content succeeded for: {text!r}")
+            except Exception as e:
+                print(f"[JARVIS] ❌ send_client_content FAILED for {text!r}: {e}")
+                traceback.print_exc()
+
+        future.add_done_callback(_log_result)
 
     def set_speaking(self, value: bool):
         with self._speaking_lock:
@@ -786,10 +841,12 @@ class JarvisLive:
             _cfg = json.loads(open(API_CONFIG_PATH, encoding="utf-8").read())
             self._asst_name = (_cfg.get("assistant_name") or "JARVIS").strip()
             _user_name = (_cfg.get("user_name") or "").strip()
+            _voice_name = (_cfg.get("voice_name") or "Kore").strip()
             log.debug(f"Fetched username is {_user_name}")
         except Exception as e:
             self._asst_name = "JARVIS"
             _user_name = "Dr. Stark"
+            _voice_name = "Kore"
             log.warning(f"Username exception: {e}")
 
         memory     = load_memory()
@@ -820,22 +877,68 @@ class JarvisLive:
         if mem_str:
             parts.append(mem_str)
         parts.append(sys_prompt)
+        parts.append("""
+GITHUB ROUTING RULES:
 
+- If the user mentions GitHub, repository, repo, branch, issue,
+  pull request, commit, GitHub file, release, tag, collaborator,
+  or GitHub account, use the GitHub MCP tools.
+
+- NEVER use browser_control or web search for GitHub data.
+
+- For "who am I on GitHub", use github_get_me.
+
+- For repository searches, use github_search_repositories.
+
+- For branches, use github_list_branches.
+
+- For issues, use the appropriate github_* issue tool.
+
+- For pull requests, use the appropriate github_* pull request tool.
+
+- For commits, use the appropriate github_* commit tool.
+
+- For GitHub files, use the appropriate github_* file tool.
+
+- If required information such as repository owner/name is missing,
+  first use GitHub MCP tools to determine it or ask the user.
+
+- Do not open github.com in a browser when GitHub MCP can perform
+  the requested operation.
+
+- The authenticated GitHub user is the owner when the user says "my GitHub".
+- Do not ask for the owner name when the request refers to "my" GitHub.
+- Use github_get_me when you need to confirm the authenticated GitHub username.
+- For "show my GitHub branches", first determine the user's GitHub username if needed, then ask only for the repository name.
+""")
         # Increase VAD silence timeout so Jarvis doesn't stop speaking too early.
         # Default server-side is ~2-3 seconds; use config value (default 15000 ms = 15 seconds) for longer responses.
         vad_silence_ms = get_vad_silence_timeout_ms()
+
+        github_tools = list(self._github_tool_declarations)
+
+        print(
+            f"[GITHUB TOOL DEBUG] Sending {len(github_tools)} GitHub tools to Gemini:",
+            [tool.get("name") for tool in github_tools],
+            flush=True,
+        )
+
 
         return types.LiveConnectConfig(
             response_modalities=["AUDIO"],
             output_audio_transcription={},
             input_audio_transcription={},
             system_instruction="\n".join(parts),
-            tools=[{"function_declarations": TOOL_DECLARATIONS}],
+            tools=[
+        {
+            "function_declarations": TOOL_DECLARATIONS+ github_tools 
+        }
+    ],
             session_resumption=types.SessionResumptionConfig(),
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name="Charon"
+                        voice_name=_voice_name
                     )
                 )
             ),
@@ -853,6 +956,8 @@ class JarvisLive:
     async def _execute_tool(self, fc) -> types.FunctionResponse:
         name = fc.name
         args = dict(fc.args or {})
+        print(f"[TOOL DEBUG] name={name}", flush=True)
+        print(f"[TOOL DEBUG] args={args}", flush=True)
 
         log.info(f"[JARVIS] 🔧 {name}  {args}")
         self.ui.set_state("THINKING")
@@ -872,7 +977,7 @@ class JarvisLive:
             )
 
         loop   = asyncio.get_event_loop()
-        result = "Done."
+        result = "Done." 
 
         try:
             if name == "open_app":
@@ -880,17 +985,41 @@ class JarvisLive:
                 result = r or f"Opened {args.get('app_name')}."
 
             elif name == "weather_report":
-                r = await loop.run_in_executor(None, lambda: weather_action(parameters=args, player=self.ui))
-                result = r or "Weather delivered."
+                try:
+                    r = await run_resilient(
+                        lambda: weather_action(parameters=args, player=self.ui),
+                        name="weather_report", loop=loop, timeout=10.0, retries=2,
+                    )
+                    result = r or "Weather delivered."
+                except (ToolError, ToolTimeout) as e:
+                    result = f"Couldn't reach the weather service after retries: {e.last_error}"
 
             elif name == "browser_control":
                 r = await loop.run_in_executor(None, lambda: browser_control(parameters=args, player=self.ui))
                 result = r or "Done."
 
             elif name == "file_controller":
-                r = await loop.run_in_executor(None, lambda: file_controller(parameters=args, player=self.ui))
-                result = r or "Done."
-
+                _fc_action = args.get("action", "")
+                if _fc_action in ("delete", "move"):
+                    _target = args.get("name") or args.get("path", "")
+                    if _fc_action == "move":
+                        _summary = f"Move '{_target}' to '{args.get('destination', '?')}'."
+                    else:
+                        _summary = f"Delete '{_target}' (moved to Trash)."
+                    should_execute, gate_msg = self._confirm_gate.check(
+                        name, args,
+                        key_fields=("action", "path", "name", "destination"),
+                        summary=_summary,
+                    )
+                    if not should_execute:
+                        result = gate_msg
+                    else:
+                        r = await loop.run_in_executor(None, lambda: file_controller(parameters=args, player=self.ui))
+                        result = r or "Done."
+                else:
+                    r = await loop.run_in_executor(None, lambda: file_controller(parameters=args, player=self.ui))
+                    result = r or "Done."
+                    
             elif name == "send_message":
                 r = await loop.run_in_executor(None, lambda: send_message(parameters=args, response=None, player=self.ui, session_memory=None))
                 result = r or f"Message sent to {args.get('receiver')}."
@@ -900,8 +1029,14 @@ class JarvisLive:
                 result = r or "Reminder set."
 
             elif name == "youtube_video":
-                r = await loop.run_in_executor(None, lambda: youtube_video(parameters=args, response=None, player=self.ui))
-                result = r or "Done."
+                try:
+                    r = await run_resilient(
+                        lambda: youtube_video(parameters=args, response=None, player=self.ui),
+                        name="youtube_video", loop=loop, timeout=20.0, retries=2,
+                    )
+                    result = r or "Done."
+                except (ToolError, ToolTimeout) as e:
+                    result = f"YouTube action failed after retries: {e.last_error}"
 
             elif name == "screen_process":
                 import time as _t_mod
@@ -955,14 +1090,21 @@ class JarvisLive:
                 result = r or "Done."
 
             elif name == "web_search":
-                r = await loop.run_in_executor(None, lambda: web_search_action(parameters=args, player=self.ui))
-                result = r or "Done."
-                # Mirror results to the on-screen content panel
-                _mode = args.get("mode", "search")
-                if r and not r.startswith("No results") and not r.startswith("Search failed"):
-                    _query = args.get("query") or ", ".join(args.get("items", []))
-                    _label = f"{_mode.upper()} — {_query[:38]}" if _query else _mode.upper()
-                    self.ui.show_content(_label, r)
+                try:
+                    r = await run_resilient(
+                        lambda: web_search_action(parameters=args, player=self.ui),
+                        name="web_search", loop=loop, timeout=20.0, retries=2,
+                    )
+                    result = r or "Done."
+                    # Mirror results to the on-screen content panel
+                    _mode = args.get("mode", "search")
+                    if r and not r.startswith("No results") and not r.startswith("Search failed"):
+                        _query = args.get("query") or ", ".join(args.get("items", []))
+                        _label = f"{_mode.upper()} — {_query[:38]}" if _query else _mode.upper()
+                        self.ui.show_content(_label, r)
+                except (ToolError, ToolTimeout) as e:
+                    result = f"Web search failed after retries: {e.last_error}"
+                    
             elif name == "file_processor":
                 if not args.get("file_path") and self.ui.current_file:
                     args["file_path"] = self.ui.current_file
@@ -981,8 +1123,14 @@ class JarvisLive:
                 result = r or "Done."
 
             elif name == "flight_finder":
-                r = await loop.run_in_executor(None, lambda: flight_finder(parameters=args, player=self.ui))
-                result = r or "Done."
+                try:
+                    r = await run_resilient(
+                        lambda: flight_finder(parameters=args, player=self.ui),
+                        name="flight_finder", loop=loop, timeout=20.0, retries=2,
+                    )
+                    result = r or "Done."
+                except (ToolError, ToolTimeout) as e:
+                    result = f"Flight search failed after retries: {e.last_error}"
                 
             elif name == "meeting_recorder":
                 action = args.get("action", "start")
@@ -1034,9 +1182,20 @@ class JarvisLive:
                     except Exception as e:
                         result = f"❌ Gmail API not authenticated: {e}"
                 else:
-                    r = await loop.run_in_executor(
-                        None,
-                        lambda: email_action(
+                    _proceed = True
+                    if action in ("send", "reply"):
+                        _who = to_addr or f"email {email_id}"
+                        _summary = f"Send an email to {_who} — subject: '{subject or '(AI-generated reply)'}'."
+                        _proceed, gate_msg = self._confirm_gate.check(
+                            name, args,
+                            key_fields=("action", "to", "subject", "body", "email_id"),
+                            summary=_summary,
+                        )
+                        if not _proceed:
+                            result = gate_msg
+
+                    if _proceed:
+                        _email_call = lambda: email_action(
                             parameters={
                                 "action": action,
                                 "max_results": max_results,
@@ -1053,8 +1212,11 @@ class JarvisLive:
                             },
                             player=self.ui,
                         )
-                    )
-                    result = r or "Done."
+                        try:
+                            r = await run_resilient(_email_call, name=f"email:{action}", loop=loop, timeout=25.0, retries=2)
+                            result = r or "Done."
+                        except (ToolError, ToolTimeout) as e:
+                            result = f"Email action '{action}' failed after retries: {e.last_error}"
 
             elif name == "enroll_person":
                 person_name = args.get("name", "").strip()
@@ -1144,16 +1306,50 @@ class JarvisLive:
                 result = str(r)
 
             elif name == "shutdown_jarvis":
-                self.ui.write_log("SYS: Shutdown requested.")
-                self.speak("Goodbye, sir.")
-                def _shutdown():
-                    import time, os
-                    time.sleep(1)
-                    os._exit(0)
-                threading.Thread(target=_shutdown, daemon=True).start()
+                should_execute, gate_msg = self._confirm_gate.check(
+                    name, args, key_fields=(), summary="The user wants to shut down Jarvis."
+                )
+                if not should_execute:
+                    result = gate_msg
+                else:
+                    self.ui.write_log("SYS: Shutdown requested.")
+                    self.speak("Goodbye, sir.")
+                    def _shutdown():
+                        import time, os
+                        time.sleep(1)
+                        os._exit(0)
+                    threading.Thread(target=_shutdown, daemon=True).start()
+
+            elif name == "recall_memory":
+                query = args.get("query", "").strip()
+                top_k = int(args.get("top_k") or 5)
+                if not query:
+                    result = "No search query provided."
+                else:
+                    try:
+                        hits = await run_resilient(
+                            lambda: recall_search(query, top_k=top_k),
+                            name="recall_memory", loop=loop, timeout=10.0, retries=1,
+                        )
+                    except (ToolError, ToolTimeout) as e:
+                        hits = []
+                        result = f"Memory search unavailable right now: {e.last_error}"
+                    else:
+                        if not hits:
+                            result = "Nothing relevant found in long-term memory for that."
+                        else:
+                            lines = [
+                                f"[{h.source_type}] {h.text}" for h in hits
+                            ]
+                            result = "Relevant memories found:\n" + "\n".join(lines)
+
+            elif name.startswith("github_"):
+                from actions.github_mcp import call_github_tool
+                result = await call_github_tool(name, args)
 
             else:
                 result = f"Unknown tool: {name}"
+            
 
         except Exception as e:
             result = f"Tool '{name}' failed: {e}"
@@ -1213,6 +1409,7 @@ class JarvisLive:
                 async for response in self.session.receive():
 
                     if response.data:
+                        print(f"[DEBUG] Got audio chunk: {len(response.data)} bytes")
                         if self._interrupted:
                             pass  # discard: interrupted
                         else:
@@ -1359,7 +1556,6 @@ class JarvisLive:
             stream.close()
 
     # ── Morning briefing ────────────────────────────────────────────────────────
-
     async def _send_startup_briefing(self) -> None:
         """
         Two-phase briefing optimized for speed:
@@ -1461,7 +1657,6 @@ class JarvisLive:
         asyncio.create_task(_deliver_news())
 
     # ── System monitor ──────────────────────────────────────────────────────────
-
     async def _run_system_monitor(self) -> None:
         """Background task: voice alerts when metrics exceed thresholds."""
         while True:
@@ -1477,7 +1672,7 @@ class JarvisLive:
                     log.warning(f"[Monitor] ⚠️ Could not send alert: {e}")
 
     # ── Proactive mode ──────────────────────────────────────────────────────────
-
+    
     async def _run_proactive_mode(self) -> None:
         """
         Background task: periodically checks if the user has been silent long enough,
@@ -1512,7 +1707,7 @@ class JarvisLive:
                 log.warning(f"[Proactive] ⚠️ {e}")
 
     # ── Phone audio relay ────────────────────────────────────────────────────────
-
+    
     async def _relay_phone_audio(self) -> None:
         """Forward phone mic PCM chunks from dashboard queue into the Gemini Live session."""
         q = self._dashboard._phone_audio_queue
@@ -1569,6 +1764,37 @@ class JarvisLive:
 
     async def run(self):
         self._loop = asyncio.get_event_loop()
+
+        from actions.file_finder import start_background_refresh
+        start_background_refresh()
+
+        # GitHub MCP tool discovery — runs ONCE per process, with a hard
+        # timeout so a slow/unreachable GitHub MCP server can NEVER block
+        # JARVIS from starting normally. On any failure or timeout, JARVIS
+        # just starts without GitHub tools (self._github_tool_declarations
+        # stays the [] set in __init__) instead of hanging.
+        from actions.github_mcp import discover_github_tools
+
+        try:
+            print("[JARVIS] Starting GitHub MCP discovery...", flush=True)
+
+            self._github_tool_declarations = await asyncio.wait_for(
+                discover_github_tools(),
+                timeout=20.0
+            )
+
+            print(
+                f"[JARVIS] GitHub tools loaded: "
+                f"{len(self._github_tool_declarations)}",
+                flush=True
+            )
+
+        except Exception as e:
+            print(
+                f"[JARVIS] GitHub MCP discovery FAILED: {e}",
+                flush=True
+            )
+            self._github_tool_declarations = []
 
         # Start dashboard (optional — needs: pip install fastapi "uvicorn[standard]" cryptography)
         try:
@@ -1651,8 +1877,7 @@ class JarvisLive:
                     self.ui.write_log("ERR: API key invalid — please re-enter your key.")
                     self.ui.set_state("SLEEPING")
                     self.ui.prompt_reconfig()
-                    while not self.ui._win._ready:
-                        await asyncio.sleep(1)
+                    await self._loop.run_in_executor(None, self.ui.wait_for_reconfig)
                     print("[JARVIS] New API key saved — reconnecting...")
                     _conn_backoff = 3
                     continue
@@ -1662,6 +1887,12 @@ class JarvisLive:
                     "TimeoutError", "timed out", "getaddrinfo", "CancelledError",
                     "ConnectionRefusedError", "OSError", "Cannot connect",
                 ))
+                self.ui.write_log(
+                    f"DEBUG ERROR: {type(e).__name__}: {e!r}"
+                )
+                self.ui.write_log(
+                    f"DEBUG ERROR STRING: {err_str!r}"
+                )
                 if is_net_err:
                     _conn_backoff = min(getattr(self, "_conn_backoff", 3) * 2, 60)
                     self._conn_backoff = _conn_backoff
@@ -1685,12 +1916,30 @@ class JarvisLive:
             await asyncio.sleep(delay)
 
 def main():
-    ui = JarvisUI("face.png")
+    headless = "--headless" in sys.argv
+
+    if headless:
+        # pyrefly: ignore [missing-import]
+        from headless_ui import HeadlessUI
+        ui = HeadlessUI()
+    else:
+        from ui import JarvisUI  # Qt only imported when actually needed
+        ui = JarvisUI("face.png")
 
     def runner():
         ui.wait_for_api_key()
         # Initialise persistent memory (creates DB, migrates legacy JSON)
         init_memory()
+
+        # Initialize OKF memory system (Open Knowledge Format)
+        try:
+            from memory.okf_memory import synchronize_memory
+            okf_concepts = synchronize_memory()
+            if okf_concepts:
+                print(f"[JARVIS] OKF memory synchronization complete: {len(okf_concepts)} concepts")
+        except Exception as e:
+            print(f"[JARVIS] OKF initialization warning: {e}")
+
         jarvis = JarvisLive(ui)
         try:
             asyncio.run(jarvis.run())
