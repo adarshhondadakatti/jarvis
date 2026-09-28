@@ -14,6 +14,12 @@ Supported types:
   video   → trim, extract_audio, extract_frame, info, compress
   zip     → list, extract
   pptx    → summarize, extract_text, to_pdf
+
+NOTE: the "summarize" action for pdf / docx / text / pptx no longer runs
+through the per-type prompt+truncate logic below. It's routed to
+file_summarizer.py instead, which does full (non-truncated) extraction,
+chunked map-reduce summarization for long documents, and caches results
+by file hash — see the top of file_processor() for the routing.
 """
 
 import os
@@ -36,7 +42,7 @@ def _gemini_client():
 
     class _W:
         def generate_content(self, contents):
-            return _c.models.generate_content(model="gemini-2.5-flash", contents=contents)
+            return _c.models.generate_content(model="gemini-3.6-flash", contents=contents)
 
     return _W()
 
@@ -289,12 +295,14 @@ def _process_pdf(path: Path, action: str, params: dict, speak=None) -> str:
             pass
         return text[:max_chars] if text else ""
 
-    if action in ("summarize", "extract_text", "translate_hint", "analyze", "reformat"):
+    # NOTE: "summarize" is intercepted earlier in file_processor() and
+    # routed to file_summarizer.py — it never reaches this branch anymore.
+    # The remaining actions here (extract_text, analyze, translate_hint,
+    # reformat) are unchanged.
+    if action in ("extract_text", "translate_hint", "analyze", "reformat"):
         text = _extract_pdf_text()
         if not text.strip():
-            # Text extraction failed — likely a scanned/image-based PDF.
-            # For "summarize" and "analyze", auto-fallback to image-based summarization.
-            if action in ("summarize", "analyze"):
+            if action == "analyze":
                 return _summarize_pdf_as_images(path, action, params)
             return "Could not extract text from PDF (may be scanned/image-based)."
 
@@ -304,7 +312,6 @@ def _process_pdf(path: Path, action: str, params: dict, speak=None) -> str:
             return f"Text extracted ({len(text)} chars). Saved: {out.name}"
 
         prompt_map = {
-            "summarize":      f"Summarize this PDF document concisely:\n\n{text}",
             "analyze":        f"Analyze this document thoroughly:\n\n{text}",
             "translate_hint": f"What language is this document in and what does it say? Summarize:\n\n{text}",
             "reformat":       f"Reformat this text cleanly with proper structure:\n\n{text}",
@@ -497,9 +504,10 @@ def _process_text_doc(path: Path, file_type: str, action: str,
             return f"Text extracted. Saved: {out.name}"
         return content[:2000]
 
+    # NOTE: "summarize" is intercepted earlier in file_processor() and
+    # routed to file_summarizer.py — it never reaches this branch anymore.
     instruction = params.get("instruction", "")
     prompt_map  = {
-        "summarize":  f"Summarize this document concisely:\n\n{content[:40000]}",
         "analyze":    f"Analyze this document:\n\n{content[:40000]}",
         "reformat":   f"Reformat this text with clean structure, proper headings and paragraphs:\n\n{content[:40000]}",
         "fix":        f"Fix grammar, spelling and style issues in this text:\n\n{content[:40000]}",
@@ -972,7 +980,9 @@ def _process_pptx(path: Path, action: str, params: dict, speak=None) -> str:
         except ImportError:
             return "python-pptx not installed."
 
-    if action in ("summarize", "extract_text", "analyze"):
+    # NOTE: "summarize" is intercepted earlier in file_processor() and
+    # routed to file_summarizer.py — it never reaches this branch anymore.
+    if action in ("extract_text", "analyze"):
         text = _read_pptx_text()
         if action == "extract_text":
             out = _output_path(path, "text", ".txt")
@@ -980,7 +990,7 @@ def _process_pptx(path: Path, action: str, params: dict, speak=None) -> str:
             return f"Text extracted. Saved: {out.name}"
         try:
             model    = _gemini_client()
-            prompt   = f"{'Summarize' if action == 'summarize' else 'Analyze'} this presentation:\n{text[:30000]}"
+            prompt   = f"Analyze this presentation:\n{text[:30000]}"
             response = model.generate_content(prompt)
             return response.text.strip()
         except Exception as e:
@@ -1006,18 +1016,29 @@ def _unblock_file(path: Path) -> bool:
 
 
 def file_processor(parameters: dict, player=None, speak=None) -> str:
+    from actions.file_summarizer import _log, _log_exception
+
     file_path_str = parameters.get("file_path", "").strip()
     if not file_path_str:
         return "No file path provided."
 
+    _log(f"[FileProcessor] Requested: '{file_path_str}'")
+
     path = Path(file_path_str)
     if not path.exists():
-        # Try to find the file by name in common directories
-        from actions.file_controller import _find_file_by_name
-        found = _find_file_by_name(file_path_str)
+        # Resolve by name via the shared, indexed fuzzy search
+        # (replaces the old file_controller._find_file_by_name).
+        from actions.file_finder import find_best_match
+        try:
+            found = find_best_match(file_path_str)
+        except Exception as e:
+            _log_exception(f"[FileProcessor] find_best_match failed for '{file_path_str}'")
+            return f"File search failed while looking for '{file_path_str}': {e}"
         if found:
+            _log(f"[FileProcessor] Resolved '{file_path_str}' -> {found}")
             path = found
         else:
+            _log(f"[FileProcessor] No match found for '{file_path_str}'")
             return f"File not found: {file_path_str}"
     if not path.is_file():
         return f"Path is not a file: {file_path_str}"
@@ -1034,6 +1055,22 @@ def file_processor(parameters: dict, player=None, speak=None) -> str:
     print(log_msg)
     if player:
         player.write_log(log_msg)
+
+    # ── Summarization routing ────────────────────────────────────────────
+    # "summarize" for the document types below now goes through the shared
+    # file_summarizer pipeline (full extraction, chunked map-reduce for long
+    # docs, cached by file hash) instead of each type's own truncate+prompt
+    # logic. Scanned/image-based PDFs still fall back to the vision path.
+    if action == "summarize" and file_type in ("pdf", "docx", "text", "pptx"):
+        from actions.file_summarizer import summarize as _summarize_doc, ScannedDocumentError, _log, _log_exception
+        try:
+            return _summarize_doc(parameters={**params, "file_path": str(path)}, player=player)
+        except ScannedDocumentError as e:
+            _log(f"[FileProcessor] {e} — falling back to image-based summarization")
+            return _summarize_pdf_as_images(path, "summarize", params)
+        except Exception as e:
+            _log_exception(f"[FileProcessor] summarize routing failed on {path}")
+            return f"Summarization failed: {e}"
 
     if file_type == "unknown":
         try:
