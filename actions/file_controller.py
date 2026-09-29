@@ -319,10 +319,11 @@ def _resolve_path(raw: str) -> Path:
     if candidate.exists():
         return candidate
 
-    # If it looks like a bare filename (no path separators), try to find it
-    # by name in common directories (Desktop, Downloads, Documents, etc.)
+    # If it looks like a bare filename (no path separators), resolve it via
+    # the shared, indexed fuzzy search instead of scanning the disk here.
     if "/" not in raw and "\\" not in raw and "~" not in raw:
-        found = _find_file_by_name(raw)
+        from actions.file_finder import find_best_match
+        found = find_best_match(raw)
         if found:
             return found
 
@@ -546,42 +547,16 @@ def write_file(path: str, name: str = "", content: str = "",
 
 def find_files(name: str = "", extension: str = "",
                path: str = "home", max_results: int = 20) -> str:
-    try:
-        search_path = _resolve_path(path)
-        if not _is_safe_path(search_path):
-            return f"Access denied: {search_path}"
-        if not search_path.exists():
-            return f"Search path not found: {path}"
-
-        results    = []
-        dir_count  = 0
-        max_dirs   = 500  # performans + güvenlik limiti
-
-        for item in search_path.rglob("*"):
-            if item.is_dir():
-                dir_count += 1
-                if dir_count > max_dirs:
-                    break
-                continue
-            if not item.is_file():
-                continue
-            if extension and item.suffix.lower() != extension.lower():
-                continue
-            if name and name.lower() not in item.name.lower():
-                continue
-            size = _format_size(item.stat().st_size)
-            results.append(f"📄 {item.name} ({size}) — {item.parent}")
-            if len(results) >= max_results:
-                break
-
-        if not results:
-            query = name or extension or "files"
-            return f"No {query} found in {search_path.name}/"
-
-        return f"Found {len(results)} file(s):\n" + "\n".join(results)
-
-    except Exception as e:
-        return f"Search error: {e}"
+    """
+    Delegates to the shared, indexed search in file_finder.py instead of
+    doing its own disk walk. `path` is accepted for backward compatibility
+    with existing callers but no longer scopes the search — the index
+    already covers all default roots (Desktop, Downloads, Documents,
+    Pictures, Music, Videos, home) with noisy directories excluded and
+    fuzzy ranking applied.
+    """
+    from actions.file_finder import find_files as _indexed_find
+    return _indexed_find(name=name, extension=extension, max_results=min(max_results, 50))
 
 
 def get_largest_files(path: str = "downloads", count: int = 10) -> str:
@@ -764,6 +739,9 @@ def file_controller(
             )
 
         elif action == "find":
+            # Kept for backward compatibility — new code should call the
+            # standalone file_finder tool directly instead of routing
+            # through file_controller.
             return find_files(
                 name=name or params.get("name", ""),
                 extension=params.get("extension", ""),
