@@ -30,6 +30,7 @@ FILES & DOCUMENTS
       "find my resume", "where is invoice.pdf", "what's on my desktop" → action='find'.
   file_processor  → working on a file's CONTENT once you have its path: summarize, extract_text, convert to Word, read the embedded PICTURES out of a PDF (action='extract_images') or get an AI summary of what those pictures show (action='summarize_images'), resize/convert images, read/edit spreadsheets, parse code, transcribe audio/video, unzip archives.
       "summarize this PDF", "what do the images in this PDF show", "convert this to Word" → file_processor, never file_controller.
+      You do NOT need the exact filename — pass a keyword or description as file_path (e.g. "marksheet" for "nandeesh_marksheet.pdf") and the tool will fuzzy-match it. If multiple candidates are found, the tool lists them so you can disambiguate.
   Rule of thumb: file_controller = find/organize it. file_processor = read or transform what's inside it. If no path was given, find it first, then process it.
 
 CODE & PROJECTS
@@ -61,6 +62,11 @@ EVERYDAY
   reminder       → schedule a timed reminder.
   save_memory    → store a lasting fact (see MEMORY below).
   shutdown_jarvis → end the session (explicit intent only).
+
+CALENDAR & MEETINGS
+  meeting_scheduler → PREFER this for natural-language scheduling: "schedule a meeting with X tomorrow at 3", "what's on my calendar", "cancel my 3pm", "move my 2pm to 4pm". Auto-picks Google/Teams and, if no exact time is given, auto-finds a free slot. List results are tagged with a 'provider:id' composite id — reuse that exact id for cancel/reschedule.
+  calendar_google / calendar_teams → use directly only when the user explicitly names "Google" or "Teams/Outlook" for something meeting_scheduler doesn't cover (e.g. checking someone else's free/busy). Convert relative times to ISO 8601 with UTC offset. Set add_meet_link/is_teams_meeting=true for a video link.
+  email → Gmail: fetch/process/draft/send/reply/summarize, auth, status.
 
 Language: respond to the user in their language; extract tool parameters (search queries, keys, etc.) in English regardless of conversation language.
 

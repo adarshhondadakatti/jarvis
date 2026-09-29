@@ -1,4 +1,12 @@
 from email.mime import text
+import sys as _sys
+
+# ── Add short-path site-packages for packages installed outside the default
+#    Windows Store Python path (e.g., insightface, onnx) ─────────────────────
+_EXTRA_PATH = "C:\\libs"
+if _EXTRA_PATH not in _sys.path:
+    _sys.path.insert(0, _EXTRA_PATH)
+
 import platform as _platform
 import subprocess as _subprocess
 # pyrefly: ignore [missing-import]
@@ -41,12 +49,22 @@ sys.excepthook = _global_excepthook
 
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="sounddevice")
+# ── Force UTF-8 console output on Windows so emoji / "→" / "—" prints never
+#    crash with UnicodeEncodeError on a default cp1252 terminal. A no-op (or
+#    harmless replace) on terminals that already support UTF-8. ──────────────
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 import sounddevice as sd
 from google import genai
 from google.genai import types
 from memory.memory_manager import (
     load_memory, update_memory, format_memory_for_prompt, init_memory,
 )
+from memory.db import ensure_db_ready
 from memory.face_memory import FaceMemory
 from memory.media_memory import MediaMemory
 from memory.event_memory import EventMemory
@@ -74,10 +92,16 @@ from actions.system_monitor    import SystemMonitor, get_system_status
 from actions.proactive         import ProactiveEngine
 from actions.web_search        import _news as _fetch_news_sync
 from actions.meeting_recorder  import MeetingRecorder, ScreenRecorder, _base_dir as _recorder_base_dir
-from memory.config_manager     import get_brief_enabled, get_vad_silence_timeout_ms
+from memory.config_manager     import (
+    get_brief_enabled, get_vad_silence_timeout_ms,
+    get_voice, save_voice, normalize_voice, LIVE_VOICES,
+)
 from actions.email             import email_action
 from core.tool_resilience      import run_resilient, ToolError,ToolTimeout, ConfirmationGate
 from memory.config_manager     import get_brief_enabled
+from actions.calendar_google   import calendar_google_action
+from actions.calendar_teams    import calendar_teams_action
+from actions.meeting_scheduler import meeting_scheduler_action
 
 
 # ── Ignore warnings ───────────────────────────────────────────────────────────
@@ -102,6 +126,26 @@ CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE          = 1024
+
+# ── Internal signal used to request a clean reconnect from a tool call ──────────
+
+
+class _RequestReconnect(Exception):
+    """
+    Raised internally (by ``_receive_audio``) to ask the ``run()`` loop for a
+    *clean* reconnect — e.g. after ``set_voice`` needs to rebuild the
+    LiveConnectConfig.  Arrives bundled in a TaskGroup ``BaseExceptionGroup``
+    which ``run()`` unwraps instead of treating as a hard error.
+    """
+
+
+def _unwrap_reconnect(exc: BaseException) -> bool:
+    """True if *exc* is (or is a group containing) a ``_RequestReconnect``."""
+    if isinstance(exc, _RequestReconnect):
+        return True
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_unwrap_reconnect(e) for e in exc.exceptions)
+    return False
 
 def _get_api_key() -> str:
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -309,11 +353,11 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "file_controller",
-        "description": "Manages files and folders: list, create, delete, move, copy, rename, read, write, find, disk usage.",
+        "description": "Manages files and folders: list, create, delete, move, copy, rename, read, open (in default app), write, find, disk usage.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":      {"type": "STRING", "description": "list | create_file | create_folder | delete | move | copy | rename | read | write | find | largest | disk_usage | organize_desktop | info"},
+                "action":      {"type": "STRING", "description": "list | create_file | create_folder | delete | move | copy | rename | read | open | write | find | largest | disk_usage | organize_desktop | info"},
                 "path":        {"type": "STRING", "description": "File/folder path or shortcut: desktop, downloads, documents, home"},
                 "destination": {"type": "STRING", "description": "Destination path for move/copy"},
                 "new_name":    {"type": "STRING", "description": "New name for rename"},
@@ -493,8 +537,8 @@ TOOL_DECLARATIONS = [
         "Processes any file that the user has uploaded or dropped onto the interface. "
         "Use this when the user refers to an uploaded file and wants an action on it. "
         "Supports: images (describe/ocr/resize/compress/convert), "
-        "PDFs (summarize/extract_text/to_word/summarize_images/extract_images), "
-        "Word docs & text files (summarize/fix/reformat/translate), "
+        "PDFs (open/summarize/extract_text/to_word/summarize_images/extract_images), "
+        "Word docs & text files (open/summarize/fix/reformat/translate), "
         "CSV/Excel (analyze/stats/filter/sort/convert), "
         "JSON/XML (validate/format/analyze), "
         "code files (explain/review/fix/optimize/run/document/test), "
@@ -503,22 +547,29 @@ TOOL_DECLARATIONS = [
         "archives (list/extract), "
         "presentations (summarize/extract_text). "
         "ALWAYS call this tool when a file has been uploaded and the user gives a command about it. "
-        "If the user's command is ambiguous, pick the most logical action for that file type."
+        "If the user's command is ambiguous, pick the most logical action for that file type. "
+        "Use 'open' to read and display file content directly without AI processing."
     ),
     "parameters": {
         "type": "OBJECT",
         "properties": {
             "file_path": {
                 "type": "STRING",
-                "description": "Full path to the uploaded file. Leave empty to use the currently uploaded file."
+                "description": (
+                    "Path to the file. Can be a full path, an exact filename, "
+                    "or even a partial name / description (e.g. 'marksheet' for "
+                    "'nandeesh_marksheet.pdf') — the tool fuzzy-matches if an "
+                    "exact path is not found. Leave empty to use the currently "
+                    "uploaded file."
+                )
             },
             "action": {
                 "type": "STRING",
                 "description": (
                     "What to do with the file. Examples by type:\n"
-                    "image: describe | ocr | resize | compress | convert | info\n"
-                    "pdf: summarize | extract_text | to_word | info | summarize_images | extract_images\n"
-                    "docx/txt: summarize | fix | reformat | translate_hint | word_count | to_bullet\n"
+                    "image: open | describe | ocr | resize | compress | convert | info\n"
+                    "pdf: open | summarize | extract_text | to_word | info | summarize_images | extract_images\n"
+                    "docx/txt: open | summarize | fix | reformat | translate_hint | word_count | to_bullet\n"
                     "csv/excel: analyze | stats | filter | sort | convert | info\n"
                     "json: validate | format | analyze | to_csv\n"
                     "code: explain | review | fix | optimize | run | document | test\n"
@@ -582,6 +633,48 @@ TOOL_DECLARATIONS = [
                 "value": {"type": "STRING", "description": "Concise value in English (e.g. Fatih, pizza, older sister)"},
             },
             "required": ["category", "key", "value"]
+        }
+    },
+    {
+        "name": "memory",
+        "description": (
+            "Manage JARVIS memory: export/import memory profiles, switch between user profiles, "
+            "list available profiles, or forget specific entries. "
+            "Actions: export (save memory to JSON file), import (load memory from JSON file), "
+            "export_okf (save memory to Open Knowledge Format directory), "
+            "import_okf (load memory from OKF directory), "
+            "switch_profile (change active profile), list_profiles (show all profiles), "
+            "get_profile (show current profile), forget (remove a specific memory entry)."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {
+                    "type": "STRING",
+                    "description": "export | import | export_okf | import_okf | switch_profile | list_profiles | get_profile | forget"
+                },
+                "profile": {
+                    "type": "STRING",
+                    "description": "Profile name (for switch_profile, export, import, forget)"
+                },
+                "file_path": {
+                    "type": "STRING",
+                    "description": "Path to JSON file (import) or OKF directory (import_okf)"
+                },
+                "overwrite": {
+                    "type": "BOOLEAN",
+                    "description": "Overwrite existing memory on import (default: false)"
+                },
+                "category": {
+                    "type": "STRING",
+                    "description": "Memory category (for forget action)"
+                },
+                "key": {
+                    "type": "STRING",
+                    "description": "Memory key to forget"
+                },
+            },
+            "required": ["action"]
         }
     },
     {
@@ -654,6 +747,120 @@ TOOL_DECLARATIONS = [
         }
     },
     {
+        "name": "calendar_google",
+        "description": (
+            "Manages Google Calendar via API: list upcoming events, create/update/delete events, "
+            "check free/busy time. Use start_time/end_time as ISO 8601 datetimes with a UTC offset "
+            "(e.g. '2026-09-19T15:00:00+05:30'). Actions: list, create, update, delete, freebusy, "
+            "auth (re-authenticate), status (check auth)."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {
+                    "type": "STRING",
+                    "description": "list | create | update | delete | freebusy | auth | status",
+                },
+                "summary": {"type": "STRING", "description": "Event title (create/update)"},
+                "start_time": {"type": "STRING", "description": "ISO 8601 datetime with UTC offset (create/update)"},
+                "end_time": {"type": "STRING", "description": "ISO 8601 datetime with UTC offset (create/update)"},
+                "description": {"type": "STRING", "description": "Event notes/body (create/update)"},
+                "location": {"type": "STRING", "description": "Event location or meeting room (create/update)"},
+                "attendees": {
+                    "type": "ARRAY",
+                    "items": {"type": "STRING"},
+                    "description": "Attendee email addresses (create/update)",
+                },
+                "add_meet_link": {"type": "BOOLEAN", "description": "Attach a Google Meet link (create only)"},
+                "event_id": {"type": "STRING", "description": "Event ID (update/delete)"},
+                "time_min": {"type": "STRING", "description": "ISO 8601 datetime with UTC offset (list/freebusy)"},
+                "time_max": {"type": "STRING", "description": "ISO 8601 datetime with UTC offset (list/freebusy)"},
+                "max_results": {"type": "INTEGER", "description": "Max events to list (default: 10)"},
+                "query": {"type": "STRING", "description": "Free-text search filter (list only)"},
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "calendar_teams",
+        "description": (
+            "Manages Microsoft 365 / Outlook Calendar via Graph API: list upcoming events, "
+            "create/update/delete events, check free/busy time for yourself or attendees. "
+            "Set is_teams_meeting=true when creating an event to attach an auto-generated "
+            "Microsoft Teams join link. Use start_time/end_time as ISO 8601 datetimes with a "
+            "UTC offset (e.g. '2026-09-22T15:00:00+05:30'). Actions: list, create, update, "
+            "delete, freebusy, auth (re-authenticate), status (check auth)."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {
+                    "type": "STRING",
+                    "description": "list | create | update | delete | freebusy | auth | status",
+                },
+                "summary": {"type": "STRING", "description": "Event title (create/update)"},
+                "start_time": {"type": "STRING", "description": "ISO 8601 datetime with UTC offset (create/update)"},
+                "end_time": {"type": "STRING", "description": "ISO 8601 datetime with UTC offset (create/update)"},
+                "description": {"type": "STRING", "description": "Event notes/body (create/update)"},
+                "location": {"type": "STRING", "description": "Event location or meeting room (create/update)"},
+                "attendees": {
+                    "type": "ARRAY",
+                    "items": {"type": "STRING"},
+                    "description": "Attendee email addresses (create/update/freebusy)",
+                },
+                "is_teams_meeting": {"type": "BOOLEAN", "description": "Attach a Microsoft Teams join link (create only)"},
+                "event_id": {"type": "STRING", "description": "Event ID (update/delete)"},
+                "time_min": {"type": "STRING", "description": "ISO 8601 datetime with UTC offset (list/freebusy)"},
+                "time_max": {"type": "STRING", "description": "ISO 8601 datetime with UTC offset (list/freebusy)"},
+                "max_results": {"type": "INTEGER", "description": "Max events to list (default: 10)"},
+                "query": {"type": "STRING", "description": "Free-text search filter (list only)"},
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "meeting_scheduler",
+        "description": (
+            "Unified meeting scheduling across Google Calendar and Teams Calendar. Prefer this "
+            "tool over calling calendar_google/calendar_teams directly for natural-language "
+            "requests like 'schedule a meeting with X tomorrow', 'what's on my calendar', "
+            "'cancel my 3pm', or 'move my meeting to 4pm'. If start_time is omitted on 'schedule', "
+            "it automatically finds the next free slot of duration_min minutes within business "
+            "hours. 'list' merges events from every configured provider, each tagged with a "
+            "composite id like 'google:abc123' or 'teams:xyz789' — pass that id back for cancel/"
+            "reschedule. Use start_time/end_time as ISO 8601 datetimes with a UTC offset."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {
+                    "type": "STRING",
+                    "description": "schedule | list | cancel | reschedule",
+                },
+                "title": {"type": "STRING", "description": "Meeting title (schedule)"},
+                "duration_min": {"type": "INTEGER", "description": "Meeting length in minutes (default: 30)"},
+                "attendees": {
+                    "type": "ARRAY",
+                    "items": {"type": "STRING"},
+                    "description": "Attendee email addresses (schedule)",
+                },
+                "start_time": {"type": "STRING", "description": "ISO 8601 datetime with UTC offset — exact start (schedule/reschedule)"},
+                "end_time": {"type": "STRING", "description": "ISO 8601 datetime with UTC offset (schedule/reschedule)"},
+                "earliest_start": {"type": "STRING", "description": "ISO 8601 datetime with UTC offset — earliest allowed auto-found start (schedule, only used when start_time is omitted)"},
+                "provider": {"type": "STRING", "description": "google | teams (omit to auto-resolve)"},
+                "description": {"type": "STRING", "description": "Meeting notes/agenda (schedule)"},
+                "location": {"type": "STRING", "description": "Physical location or meeting room (schedule)"},
+                "video_link": {"type": "BOOLEAN", "description": "Attach a video call link (default: true) (schedule)"},
+                "search_days": {"type": "INTEGER", "description": "Days ahead to search for a free slot (default: 5) (schedule)"},
+                "event_id": {"type": "STRING", "description": "Composite id 'provider:id' from a list result (cancel/reschedule)"},
+                "time_min": {"type": "STRING", "description": "ISO 8601 datetime with UTC offset (list)"},
+                "time_max": {"type": "STRING", "description": "ISO 8601 datetime with UTC offset (list)"},
+                "max_results": {"type": "INTEGER", "description": "Max meetings to list (default: 10)"},
+            },
+            "required": ["action"]
+        }
+    },
+    {
         "name": "enroll_person",
         "description": (
             "Enroll a new person into face memory by name. "
@@ -661,7 +868,8 @@ TOOL_DECLARATIONS = [
             "Captures a camera frame, detects the face, creates a person record, and stores "
             "the face embedding. If a person with the same name already exists, their embeddings "
             "are updated with the new face. "
-            "Returns the person ID and number of faces detected."
+            "The person is associated with the current memory profile, so face recognition "
+            "can automatically switch to the appropriate profile."
         ),
         "parameters": {
             "type": "OBJECT",
@@ -669,6 +877,10 @@ TOOL_DECLARATIONS = [
                 "name": {
                     "type": "STRING",
                     "description": "The person's name (e.g., 'Alice', 'John Smith')"
+                },
+                "profile": {
+                    "type": "STRING",
+                    "description": "Memory profile to associate (default: current profile)"
                 }
             },
             "required": ["name"]
@@ -706,6 +918,30 @@ TOOL_DECLARATIONS = [
                 }
             },
             "required": ["name"]
+        }
+    },
+    {
+        "name": "set_voice",
+        "description": (
+            "Changes JARVIS's speaking voice (the Gemini Live TTS voice). "
+            "Call when the user asks to change voice or style — e.g. "
+            "'use a deep voice', 'try a female voice', 'switch to Puck', "
+            "'sound more robotic'. The change persists in config and takes "
+            "effect after a brief automatic reconnect."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "voice": {
+                    "type": "STRING",
+                    "description": (
+                        "Voice name. Some options: Charon (deep), Puck (neutral), "
+                        "Kore (warm), Zephyr (bright), Aoede (breezy), Fenrir (excited), "
+                        "Leda (youthful), Erinome (clear), Gacrux (mature)."
+                    )
+                }
+            },
+            "required": ["voice"]
         }
     },
 ]
@@ -747,6 +983,7 @@ class JarvisLive:
         self._screen_recorder  = ScreenRecorder()
         self._last_meeting_dir = None
         self._confirm_gate = ConfirmationGate()
+        self._reconnect_requested = False             # set by tools (e.g. set_voice) to force a clean reconnect
 
         # GitHub MCP — populated by run() at startup (async fetch there);
         # defaults to [] here so _build_config() has something to read from
@@ -914,6 +1151,9 @@ GITHUB ROUTING RULES:
         # Increase VAD silence timeout so Jarvis doesn't stop speaking too early.
         # Default server-side is ~2-3 seconds; use config value (default 15000 ms = 15 seconds) for longer responses.
         vad_silence_ms = get_vad_silence_timeout_ms()
+        # Resolve the Gemini Live voice from config (validated against the
+        # supported set; invalid names fall back to "Charon").
+        _voice = normalize_voice(get_voice())
 
         github_tools = list(self._github_tool_declarations)
 
@@ -938,7 +1178,7 @@ GITHUB ROUTING RULES:
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name=_voice_name
+                        voice_name=_voice
                     )
                 )
             ),
@@ -974,6 +1214,60 @@ GITHUB ROUTING RULES:
             return types.FunctionResponse(
                 id=fc.id, name=name,
                 response={"result": "ok", "silent": True}
+            )
+
+        if name == "memory":
+            from memory.memory_manager import (
+                export_memory, import_memory, switch_profile,
+                list_profiles, get_profile, forget,
+                export_okf, import_okf,
+            )
+            action = args.get("action", "").lower().strip()
+            profile = args.get("profile", "").strip() or None
+            file_path = args.get("file_path", "")
+            overwrite = args.get("overwrite", False)
+
+            if action == "export":
+                result = export_memory(profile)
+            elif action == "import":
+                if not file_path:
+                    result = "Please provide a file_path to import from."
+                else:
+                    result = import_memory(file_path, profile, overwrite)
+            elif action == "export_okf":
+                result = export_okf(profile)
+            elif action == "import_okf":
+                if not file_path:
+                    result = "Please provide a file_path (OKF directory) to import from."
+                else:
+                    result = import_okf(file_path, profile, overwrite)
+            elif action == "switch_profile":
+                if not profile:
+                    result = "Please provide a profile name."
+                else:
+                    result = switch_profile(profile)
+                    await self._refresh_memory_context()
+            elif action == "list_profiles":
+                result = list_profiles()
+            elif action == "get_profile":
+                result = f"Current memory profile: {get_profile()}"
+            elif action == "forget":
+                category = args.get("category", "notes")
+                key = args.get("key", "")
+                if not key:
+                    result = "Please provide a key to forget."
+                else:
+                    result = forget(key, category, profile)
+            else:
+                result = (f"Unknown memory action: '{action}'. "
+                          f"Use: export, import, export_okf, import_okf, "
+                          f"switch_profile, list_profiles, get_profile, forget")
+
+            if not self.ui.muted:
+                self.ui.set_state("LISTENING")
+            return types.FunctionResponse(
+                id=fc.id, name=name,
+                response={"result": result}
             )
 
         loop   = asyncio.get_event_loop()
@@ -1218,15 +1512,72 @@ GITHUB ROUTING RULES:
                         except (ToolError, ToolTimeout) as e:
                             result = f"Email action '{action}' failed after retries: {e.last_error}"
 
+            elif name == "calendar_google":
+                r = await loop.run_in_executor(
+                    None,
+                    lambda: calendar_google_action(parameters=args, player=self.ui)
+                )
+                result = r or "Done."
+
+            elif name == "calendar_teams":
+                r = await loop.run_in_executor(
+                    None,
+                    lambda: calendar_teams_action(parameters=args, player=self.ui)
+                )
+                result = r or "Done."
+
+            elif name == "meeting_scheduler":
+                r = await loop.run_in_executor(
+                    None,
+                    lambda: meeting_scheduler_action(parameters=args, player=self.ui)
+                )
+                result = r or "Done."
+
             elif name == "enroll_person":
                 person_name = args.get("name", "").strip()
                 if not person_name:
                     result = "I need a name to enroll. Please say 'This is Alice' or similar."
                 else:
                     try:
-                        img_bytes, _ = await loop.run_in_executor(None, _capture_camera)
+                        # Prefer the face captured during auto-detect startup if one
+                        # is stashed; otherwise grab a fresh frame from the camera.
+                        if self._pending_face_image is not None:
+                            img_bytes = self._pending_face_image
+                            self._pending_face_image = None
+                            self._awaiting_enrollment = False
+                        else:
+                            img_bytes, _ = await loop.run_in_executor(None, _capture_camera)
+
+                        # Resolve the memory profile for this person:
+                        #  • known name  → switch to that person's existing profile
+                        #  • new name    → create a new profile folder named after them
+                        from memory.memory_manager import (
+                            switch_profile, get_profile, get_profiles,
+                        )
+                        profiles = get_profiles()
+                        existing_person = self._face_memory.find_person_by_name(person_name)
+
+                        if args.get("profile"):
+                            profile = args["profile"].strip()
+                        elif existing_person and existing_person.profile:
+                            # Reuse the profile already attached to this known person
+                            profile = existing_person.profile
+                        else:
+                            # Derive a filesystem-safe profile name from the person's name
+                            slug = re.sub(r"[^a-z0-9]+", "_", person_name.lower()).strip("_")
+                            profile = slug or "default"
+
+                        if profile not in profiles:
+                            # New profile folder — created & activated atomically by switch_profile
+                            switch_profile(profile)
+                        elif profile != get_profile():
+                            # Existing profile — switch to it
+                            switch_profile(profile)
+                        await self._refresh_memory_context()
+
                         person_id = self._face_memory.enroll_person(
-                            person_name, img_bytes, source="camera"
+                            person_name, img_bytes, source="camera",
+                            profile=profile,
                         )
                         if person_id:
                             # Store the image as media and link to the person
@@ -1245,9 +1596,16 @@ GITHUB ROUTING RULES:
                             self._event_memory.link_media(event_id, media_id, role="primary")
 
                             emb_count = self._face_memory.count_embeddings()
-                            result = f"Enrolled {person_name} (ID: {person_id}). Face embeddings stored. Total embeddings: {emb_count}."
+                            result = (
+                                f"Enrolled {person_name} (ID: {person_id}). "
+                                f"Face embeddings stored. Total embeddings: {emb_count}. "
+                                f"Memory profile: '{profile}'."
+                            )
                         else:
-                            result = f"I couldn't detect a face in the camera frame. Please make sure you're facing the camera and try again."
+                            result = (
+                                f"I couldn't detect a face in the camera frame. "
+                                f"Please make sure you're facing the camera and try again."
+                            )
                     except Exception as e:
                         result = f"Face enrollment failed: {e}. Make sure insightface is installed."
 
@@ -1262,6 +1620,12 @@ GITHUB ROUTING RULES:
                         for m in matches:
                             if m.is_known:
                                 parts.append(f"{m.person_name} (confidence: {m.confidence:.2f})")
+                                # Auto-switch to the recognized person's memory profile
+                                if m.profile and m.profile != get_profile():
+                                    from memory.memory_manager import switch_profile
+                                    switch_profile(m.profile)
+                                    await self._refresh_memory_context()
+                                    parts[-1] += f" -> switched to profile: {m.profile}"
                             else:
                                 parts.append(f"Unknown person (confidence: {m.confidence:.2f})")
                         result = f"Detected {len(matches)} face(s): " + ", ".join(parts)
@@ -1300,6 +1664,24 @@ GITHUB ROUTING RULES:
                                 lines.append(f"  - {h['created_at']}: {h['media_type']} (confidence: {h['confidence']:.2f})")
 
                         result = "\n".join(lines)
+
+            elif name == "set_voice":
+                voice = args.get("voice", "").strip()
+                if not voice:
+                    result = "I need a voice name, e.g. Charon, Puck, or Kore."
+                elif normalize_voice(voice) != voice and voice not in LIVE_VOICES:
+                    # Unknown voice — reject with a helpful list instead of
+                    # persisting something the model will reject on connect.
+                    result = (
+                        f"I don't recognize '{voice}'. Try one of: "
+                        + ", ".join(LIVE_VOICES[:9])
+                        + " ..."
+                    )
+                else:
+                    save_voice(normalize_voice(voice))
+                    self._reconnect_requested = True
+                    result = f"Voice set to {normalize_voice(voice)}. Reconnecting to apply."
+                self.ui.write_log(f"SYS: set_voice -> {voice} (pending reconnect)")
 
             elif name == "system_status":
                 r = await loop.run_in_executor(None, get_system_status)
@@ -1368,13 +1750,36 @@ GITHUB ROUTING RULES:
     async def _send_realtime(self):
         while True:
             msg = await self.out_queue.get()
-            await self.session.send_realtime_input(media=msg)
+            # A single failed realtime send (transient API throttle / pipe error)
+            # must NOT tear down the whole TaskGroup and kill the session.
+            # Drop the chunk and keep pumping so Jarvis stays alive.
+            try:
+                await self.session.send_realtime_input(media=msg)
+            except Exception as e:
+                log.warning(f"[JARVIS] ⚠️  send_realtime_input failed — dropped chunk: {e}")
+                print(f"[JARVIS] ⚠️  send_realtime_input failed — dropped chunk: {e}")
 
     async def _listen_audio(self):
         print("[JARVIS] 🎤 Mic started")
         loop = asyncio.get_event_loop()
 
+        _last_overflow_ts = 0.0  # rate-limit benign overflow logs to once per 5 s
+
         def callback(indata, frames, time_info, status):
+            nonlocal _last_overflow_ts
+            if status:
+                # input_overflow is benign & frequent (GC pauses, brief callback
+                # stalls under load).  Rate-limit it to DEBUG so the logs
+                # aren't flooded with "input overflow" warnings.
+                if status.input_overflow:
+                    now = time.monotonic()
+                    if now - _last_overflow_ts >= 5.0:
+                        log.debug("[JARVIS] 🎤 Mic input overflow (benign, rate-limited)")
+                        _last_overflow_ts = now
+                else:
+                    # All other flags (host errors, device disconnects, etc.)
+                    # are genuine problems — surface as WARNING.
+                    log.warning(f"[JARVIS] 🎤 Mic status: {status}")
             with self._speaking_lock:
                 jarvis_speaking = self._is_speaking
             if not jarvis_speaking and not self.ui.muted and not self._phone_active:
@@ -1510,6 +1915,14 @@ GITHUB ROUTING RULES:
                         await self.session.send_tool_response(
                             function_responses=fn_responses
                         )
+
+                    # A tool (e.g. set_voice) requested a clean reconnect — exit
+                    # the receive loop so the TaskGroup tears down and run()
+                    # rebuilds the session with the new settings.
+                    if self._reconnect_requested:
+                        raise _RequestReconnect
+        except _RequestReconnect:
+            raise
         except Exception as e:
             log.error(f"[JARVIS] ❌ Recv: {e}")
             traceback.print_exc()
@@ -1706,6 +2119,130 @@ GITHUB ROUTING RULES:
             except Exception as e:
                 log.warning(f"[Proactive] ⚠️ {e}")
 
+    # ── Auto profile detection at startup ────────────────────────────────────────
+
+    async def _refresh_memory_context(self) -> None:
+        """
+        Push the currently-active profile's memory into the *active* session.
+
+        The system prompt (built once per connection in ``_build_config``)
+        is baked into the LiveConnectConfig at connect time and cannot be
+        updated mid-session by the Gemini Live API.  So a profile switch
+        that happens after connect — e.g. face-based auto-detect or the
+        ``recognize_person`` tool — would otherwise leave the model
+        answering with the *previous* profile's memory for the rest of the
+        session.  This injects the new profile's facts as interim client
+        content (``turn_complete=False``) so the model sees them immediately.
+        """
+        if not self.session:
+            return
+        try:
+            from memory.memory_manager import get_profile
+            memory = load_memory()
+            mem_str = format_memory_for_prompt(memory, face_memory=self._face_memory)
+            prof = get_profile()
+            if mem_str:
+                text = (
+                    f"[MEMORY CONTEXT] Active profile is now '{prof}'.\n"
+                    f"Use the following facts about the user for the remainder of this session:\n"
+                    f"{mem_str}"
+                )
+            else:
+                text = (
+                    f"[MEMORY CONTEXT] Active profile is now '{prof}'. "
+                    f"This profile has no stored facts yet."
+                )
+            await self.session.send_client_content(
+                turns={"parts": [{"text": text}]},
+                turn_complete=False,
+            )
+            self.ui.write_log(f"SYS: Refreshed in-session memory context -> '{prof}'.")
+        except Exception as e:
+            log.warning(f"[Memory] Could not refresh in-session context: {e}")
+
+    async def _auto_detect_profile(self) -> None:
+        """
+        At startup, open the camera and look for faces.
+        - If a known face is recognized, automatically switch to that person's profile.
+        - If an unknown face is detected, ask for the name, enroll them, and switch.
+        - If no face or camera is unavailable, skip silently.
+        """
+        if not self._face_memory.is_available:
+            self.ui.write_log("SYS: Face recognition not available — skipping auto-detect.")
+            return
+
+        try:
+            # Wait for session to be ready
+            for _ in range(20):  # up to 2 seconds
+                if self.session is not None:
+                    break
+                await asyncio.sleep(0.1)
+
+            if self.session is None:
+                self.ui.write_log("SYS: Session not ready — skipping auto-detect.")
+                return
+
+            # Small delay to ensure session is fully established
+            await asyncio.sleep(0.5)
+
+            loop = asyncio.get_event_loop()
+            img_bytes, _ = await loop.run_in_executor(None, _capture_camera)
+
+            if not img_bytes:
+                self.ui.write_log("SYS: Camera capture failed — skipping auto-detect.")
+                return
+
+            matches = self._face_memory.recognize_faces(img_bytes)
+
+            if not matches:
+                self.ui.write_log("SYS: No faces detected at startup — using default profile.")
+                return
+
+            # Check for known faces
+            known = [m for m in matches if m.is_known]
+            unknown = [m for m in matches if not m.is_known]
+
+            if known:
+                # Switch to the first known person's profile
+                person = known[0]
+                from memory.memory_manager import switch_profile
+                switch_profile(person.profile)
+                await self._refresh_memory_context()
+                self.ui.write_log(
+                    f"SYS: Recognized {person.person_name} -> switched to profile '{person.profile}'"
+                )
+                # Greet the user
+                await self.session.send_client_content(
+                    turns={"parts": [{"text": f"Welcome back, {person.person_name}!"}]},
+                    turn_complete=True,
+                )
+            elif unknown:
+                # Unknown face — stash the captured frame so the upcoming enrollment
+                # reuses the face we just detected (more reliable than re-capturing),
+                # then ask for the name. When the user states it, the model will call
+                # the enroll_person tool, which creates a new profile folder (or
+                # switches to an existing one) and stores the embedding.
+                self._pending_face_image = img_bytes
+                self._awaiting_enrollment = True
+                await self.session.send_client_content(
+                    turns={"parts": [{
+                        "text": (
+                            "I see someone I don't know yet. Please tell me your name — "
+                            "for example, 'my name is Alex' or 'this is Alex' — and I'll "
+                            "set up a profile for you and remember your face."
+                        )
+                    }]},
+                    turn_complete=True,
+                )
+                self.ui.write_log(
+                    "SYS: Unknown face detected at startup. "
+                    "Listening for the user to state their name…"
+                )
+
+        except Exception as e:
+            log.warning(f"[AutoDetect] Face detection at startup failed: {e}")
+            self.ui.write_log(f"SYS: Auto-detect failed: {e}")
+
     # ── Phone audio relay ────────────────────────────────────────────────────────
     
     async def _relay_phone_audio(self) -> None:
@@ -1836,6 +2373,9 @@ GITHUB ROUTING RULES:
                     self._vision_busy          = False
                     self._vision_last_time     = 0.0
                     self._interrupted          = False
+                    self._pending_face_image   = None
+                    self._awaiting_enrollment  = False
+                    self._reconnect_requested = False
 
                     print("[JARVIS] Connected.")
                     self.ui.set_state("LISTENING")
@@ -1858,11 +2398,22 @@ GITHUB ROUTING RULES:
                         self._briefing_sent = True
                         tg.create_task(self._send_startup_briefing())
 
+                    # Auto-detect profile via face recognition at startup
+                    tg.create_task(self._auto_detect_profile())
+
             except KeyboardInterrupt:
                 raise
             except SystemExit:
                 raise
             except BaseException as e:
+                # A tool requested a clean reconnect (e.g. set_voice rebuilding
+                # the LiveConnectConfig). run() unwraps it from the TaskGroup's
+                # BaseExceptionGroup and simply reconnects — no error logging.
+                if _unwrap_reconnect(e):
+                    self.ui.write_log("SYS: Reconnecting to apply updated settings (e.g. voice change).")
+                    _conn_backoff = 1
+                    continue
+
                 # Catches both Exception and BaseExceptionGroup (Python 3.11+
                 # TaskGroup raises BaseExceptionGroup when tasks are cancelled
                 # externally, which `except Exception` would miss, letting the
@@ -1928,7 +2479,7 @@ def main():
 
     def runner():
         ui.wait_for_api_key()
-        # Initialise persistent memory (creates DB, migrates legacy JSON)
+        # Initialise persistent memory (creates DB schema + OKF dirs)
         init_memory()
 
         # Initialize OKF memory system (Open Knowledge Format)
@@ -1940,6 +2491,7 @@ def main():
         except Exception as e:
             print(f"[JARVIS] OKF initialization warning: {e}")
 
+        ensure_db_ready()
         jarvis = JarvisLive(ui)
         try:
             asyncio.run(jarvis.run())

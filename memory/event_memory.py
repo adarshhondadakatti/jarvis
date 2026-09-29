@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
-from memory.db import _connect, _lock
+from memory.db import _connect, _get_lock
 
 
 # ── Data classes ───────────────────────────────────────────────────────────────
@@ -143,7 +143,7 @@ class EventMemory:
         now = datetime.now().isoformat()
         meta_json = json.dumps(metadata) if metadata else None
 
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 cur = conn.execute(
@@ -199,7 +199,7 @@ class EventMemory:
 
         values.append(event_id)
 
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 cur = conn.execute(
@@ -221,7 +221,7 @@ class EventMemory:
         Returns:
             True if the event was deleted, False if not found.
         """
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 cur = conn.execute("DELETE FROM events WHERE id = ?", (event_id,))
@@ -250,7 +250,7 @@ class EventMemory:
         Returns:
             True if the link was created, False if event or media not found.
         """
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 # Verify event exists
@@ -297,7 +297,7 @@ class EventMemory:
         Returns:
             True if the link was created, False if event or person not found.
         """
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 # Verify event exists
@@ -328,7 +328,7 @@ class EventMemory:
 
     def unlink_media(self, event_id: int, media_id: int) -> bool:
         """Remove a media link from an event."""
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 cur = conn.execute(
@@ -342,7 +342,7 @@ class EventMemory:
 
     def unlink_person(self, event_id: int, person_id: int) -> bool:
         """Remove a person link from an event."""
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 cur = conn.execute(
@@ -366,7 +366,7 @@ class EventMemory:
         Returns:
             EventDetail with all links, or None if not found.
         """
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 row = conn.execute(
@@ -461,7 +461,7 @@ class EventMemory:
         Returns:
             List of EventRecord, sorted by started_at descending.
         """
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 rows = conn.execute(
@@ -495,7 +495,7 @@ class EventMemory:
         Returns:
             List of EventRecord, sorted by started_at descending.
         """
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 rows = conn.execute(
@@ -536,7 +536,7 @@ class EventMemory:
         if end is None:
             end = datetime.now().isoformat()
 
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 rows = conn.execute(
@@ -572,7 +572,7 @@ class EventMemory:
         Returns:
             List of EventRecord, sorted by started_at descending.
         """
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 rows = conn.execute(
@@ -619,7 +619,7 @@ class EventMemory:
 
         Useful for answering "When did you first meet Bob?"
         """
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 rows = conn.execute(
@@ -644,7 +644,7 @@ class EventMemory:
 
     def count_events(self) -> int:
         """Return the total number of events."""
-        with _lock:
+        with _get_lock():
             conn = _connect()
             try:
                 return conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]

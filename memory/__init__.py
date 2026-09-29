@@ -34,6 +34,7 @@ from memory.vector_store import VectorStore, SQLiteVectorStore, get_vector_store
 
 # ── Face recognition backend ───────────────────────────────────────────────────
 from recognition.face_backend import FaceBackend, FaceDetection, InsightFaceError
+from recognition.face_quality import FaceQuality
 
 __all__ = [
     # Textual memory
@@ -62,4 +63,5 @@ __all__ = [
     "FaceBackend",
     "FaceDetection",
     "InsightFaceError",
+    "FaceQuality",
 ]

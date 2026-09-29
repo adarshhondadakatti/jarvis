@@ -91,6 +91,10 @@ def _process_image(path: Path, action: str, params: dict, speak=None) -> str:
 
     action = action or "describe"
 
+    if action == "open":
+        # For images, "open" means describe the image
+        action = "describe"
+
     if action in ("describe", "ocr", "analyze", "read", "extract_text"):
         try:
             model  = _gemini_client()
@@ -295,11 +299,16 @@ def _process_pdf(path: Path, action: str, params: dict, speak=None) -> str:
             pass
         return text[:max_chars] if text else ""
 
-    # NOTE: "summarize" is intercepted earlier in file_processor() and
-    # routed to file_summarizer.py — it never reaches this branch anymore.
-    # The remaining actions here (extract_text, analyze, translate_hint,
-    # reformat) are unchanged.
-    if action in ("extract_text", "translate_hint", "analyze", "reformat"):
+    if action == "open":
+        # Read and return PDF text content
+        text = _extract_pdf_text()
+        if not text.strip():
+            return _summarize_pdf_as_images(path, "summarize", params)
+        if len(text) > 4000:
+            return text[:4000] + f"\n\n[...truncated — {len(text)} total chars]"
+        return text
+
+    if action in ("summarize", "extract_text", "translate_hint", "analyze", "reformat"):
         text = _extract_pdf_text()
         if not text.strip():
             if action == "analyze":
@@ -490,6 +499,12 @@ def _process_text_doc(path: Path, file_type: str, action: str,
     content = _read_content()
     if not content.strip():
         return "File appears to be empty."
+
+    if action == "open":
+        # Just read and return the file content
+        if len(content) > 4000:
+            return content[:4000] + f"\n\n[...truncated — {len(content)} total chars]"
+        return content
 
     if action == "word_count":
         words = len(content.split())
@@ -1026,20 +1041,32 @@ def file_processor(parameters: dict, player=None, speak=None) -> str:
 
     path = Path(file_path_str)
     if not path.exists():
-        # Resolve by name via the shared, indexed fuzzy search
-        # (replaces the old file_controller._find_file_by_name).
-        from actions.file_finder import find_best_match
-        try:
-            found = find_best_match(file_path_str)
-        except Exception as e:
-            _log_exception(f"[FileProcessor] find_best_match failed for '{file_path_str}'")
-            return f"File search failed while looking for '{file_path_str}': {e}"
+        # Phase 1: exact (case-insensitive) name match in common dirs
+        from actions.file_controller import _find_file_by_name
+        found = _find_file_by_name(file_path_str)
         if found:
             _log(f"[FileProcessor] Resolved '{file_path_str}' -> {found}")
             path = found
         else:
-            _log(f"[FileProcessor] No match found for '{file_path_str}'")
-            return f"File not found: {file_path_str}"
+            # Phase 2: fuzzy match — the user may have referred to the file
+            # by a keyword or description rather than its exact name, e.g.
+            # "marksheet" → "nandeesh_marksheet.pdf".
+            from actions.file_controller import _find_file_fuzzy
+            matches = _find_file_fuzzy(file_path_str)
+
+            if len(matches) == 1:
+                path = matches[0]
+            elif len(matches) > 1:
+                listing = "\n".join(f"  • {m.name}" for m in matches[:5])
+                extra = f"\n...and {len(matches) - 5} more" if len(matches) > 5 else ""
+                return (
+                    f"I could not find an exact match for '{file_path_str}', "
+                    f"but I found {len(matches)} similar file(s):\n"
+                    f"{listing}{extra}\n\n"
+                    f"Which one did you mean?"
+                )
+            else:
+                return f"File not found: {file_path_str}"
     if not path.is_file():
         return f"Path is not a file: {file_path_str}"
 
