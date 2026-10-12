@@ -289,3 +289,35 @@ def ensure_db_ready() -> None:
     """
     init_db()
     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ── Text memory backward compatibility (delegated to memory_manager) ─────────
+
+def db_load_memory(profile: str | None = None) -> dict:
+    from memory.memory_manager import load_memory as _load
+    return _load(profile)
+
+load_memory = db_load_memory
+
+
+def db_upsert(category: str, key: str, value: str, updated: str | None = None, profile: str | None = None) -> None:
+    from memory.memory_manager import update_memory as _update
+    _update({category: {key: {"value": value, "updated": updated}}}, profile=profile)
+
+
+def db_delete(category: str, key: str, profile: str | None = None) -> bool:
+    from memory.memory_manager import forget as _forget
+    res = _forget(key, category, profile=profile)
+    return "Forgotten:" in res
+
+
+def db_count(profile: str | None = None) -> int:
+    mem = db_load_memory(profile)
+    return sum(len(v) for v in mem.values() if isinstance(v, dict))
+
+
+try:
+    from memory.memory_manager import VALID_CATEGORIES
+except ImportError:
+    VALID_CATEGORIES = ("identity", "preferences", "projects", "relationships", "wishes", "notes")
+
