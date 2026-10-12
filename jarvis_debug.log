@@ -1,0 +1,51 @@
+[2026-10-12 15:29:14] [github_mcp] Discovered 46 GitHub tools:
+[2026-10-12 15:29:14] [github_mcp]   - github_add_comment_to_pending_review: Add review comment to the requester's latest pending pull request review. A pending review needs to 
+[2026-10-12 15:29:14] [github_mcp]   - github_add_issue_comment: Add a comment and/or reaction to a specific issue or issue comment in a GitHub repository. Use this 
+[2026-10-12 15:29:14] [github_mcp]   - github_add_reply_to_pull_request_comment: Add a reply and/or reaction to an existing pull request comment. This can create a new comment linke
+[2026-10-12 15:29:14] [github_mcp]   - github_create_branch: Create a new branch in a GitHub repository
+[2026-10-12 15:29:14] [github_mcp]   - github_create_or_update_file: Create or update a single file in a GitHub repository. 
+If updating, you should provide the SHA of t
+[2026-10-12 15:29:14] [github_mcp]   - github_create_pull_request: Create a new pull request in a GitHub repository.
+[2026-10-12 15:29:14] [github_mcp]   - github_create_repository: Create a new GitHub repository in your account or specified organization
+[2026-10-12 15:29:14] [github_mcp]   - github_delete_file: Delete a file from a GitHub repository
+[2026-10-12 15:29:14] [github_mcp]   - github_fork_repository: Fork a GitHub repository to your account or specified organization
+[2026-10-12 15:29:14] [github_mcp]   - github_get_commit: Get details for a commit from a GitHub repository
+[2026-10-12 15:29:14] [github_mcp]   - github_get_file_contents: Get the contents of a file or directory from a GitHub repository
+[2026-10-12 15:29:14] [github_mcp]   - github_get_label: Get a specific label from a repository.
+[2026-10-12 15:29:14] [github_mcp]   - github_get_latest_release: Get the latest release in a GitHub repository
+[2026-10-12 15:29:14] [github_mcp]   - github_get_me: Get details of the authenticated GitHub user. Use this when a request is about the user's own profil
+[2026-10-12 15:29:14] [github_mcp]   - github_get_release_by_tag: Get a specific release by its tag name in a GitHub repository
+[2026-10-12 15:29:14] [github_mcp]   - github_get_tag: Get details about a specific git tag in a GitHub repository
+[2026-10-12 15:29:14] [github_mcp]   - github_get_team_members: Get member usernames of a specific team in an organization. Limited to organizations accessible with
+[2026-10-12 15:29:14] [github_mcp]   - github_get_teams: Get details of the teams the user is a member of. Limited to organizations accessible with current c
+[2026-10-12 15:29:14] [github_mcp]   - github_issue_read: Get information about a specific issue in a GitHub repository.
+[2026-10-12 15:29:14] [github_mcp]   - github_issue_write: Create a new or update an existing issue in a GitHub repository.
+[2026-10-12 15:29:14] [github_mcp]   - github_list_branches: List branches in a GitHub repository
+[2026-10-12 15:29:14] [github_mcp]   - github_list_commits: Get list of commits of a branch in a GitHub repository. Returns at least 30 results per page by defa
+[2026-10-12 15:29:14] [github_mcp]   - github_list_issue_fields: List issue fields for a repository or organization. Returns field definitions including name, type (
+[2026-10-12 15:29:14] [github_mcp]   - github_list_issue_types: List supported issue types for a repository or its owner organization. When repo is omitted, returns
+[2026-10-12 15:29:14] [github_mcp]   - github_list_issues: List issues in a GitHub repository. For pagination, use the 'endCursor' from the previous response's
+[2026-10-12 15:29:14] [github_mcp]   - github_list_pull_requests: List pull requests in a GitHub repository. If the user specifies an author, then DO NOT use this too
+[2026-10-12 15:29:14] [github_mcp]   - github_list_releases: List releases in a GitHub repository
+[2026-10-12 15:29:14] [github_mcp]   - github_list_repository_collaborators: List collaborators of a GitHub repository. Results are paginated; the response includes `nextPage`, 
+[2026-10-12 15:29:14] [github_mcp]   - github_list_tags: List git tags in a GitHub repository
+[2026-10-12 15:29:14] [github_mcp]   - github_merge_pull_request: Merge a pull request in a GitHub repository.
+[2026-10-12 15:29:14] [github_mcp]   - github_pull_request_read: Get information on a specific pull request in GitHub repository.
+[2026-10-12 15:29:14] [github_mcp]   - github_pull_request_review_write: Create and/or submit, delete review of a pull request.
+
+Available methods:
+- create: Create a new re
+[2026-10-12 15:29:14] [github_mcp]   - github_push_files: Push multiple files to a GitHub repository in a single commit
+[2026-10-12 15:29:14] [github_mcp]   - github_request_copilot_review: Request a GitHub Copilot code review for a pull request. Use this for automated feedback on pull req
+[2026-10-12 15:29:14] [github_mcp]   - github_run_secret_scanning: Scan files, content, or recent changes for secrets such as API keys, passwords, tokens, and credenti
+[2026-10-12 15:29:14] [github_mcp]   - github_search_code: Fast and precise code search across ALL GitHub repositories using GitHub's native search engine. Bes
+[2026-10-12 15:29:14] [github_mcp]   - github_search_commits: Search for commits across GitHub repositories using GitHub's commit search syntax. Useful for findin
+[2026-10-12 15:29:14] [github_mcp]   - github_search_issues: Search issues using natural-language semantic matching. Best for conceptual or paraphrased queries (
+[2026-10-12 15:29:14] [github_mcp]   - github_search_pull_requests: Search for pull requests in GitHub repositories using issues search syntax already scoped to is:pr
+[2026-10-12 15:29:14] [github_mcp]   - github_search_repositories: Find GitHub repositories by name, description, readme, topics, or other metadata. Perfect for discov
+[2026-10-12 15:29:14] [github_mcp]   - github_search_users: Find GitHub users by username, real name, or other profile information. Useful for locating develope
+[2026-10-12 15:29:14] [github_mcp]   - github_sub_issue_write: Add a sub-issue to a parent issue in a GitHub repository.
+[2026-10-12 15:29:14] [github_mcp]   - github_ui_get: Fetch UI data for MCP Apps (labels, assignees, milestones, issue types, branches, issue fields, revi
+[2026-10-12 15:29:14] [github_mcp]   - github_update_issue_comment: Update the body of an existing issue or pull request conversation comment. This tool cannot update p
+[2026-10-12 15:29:14] [github_mcp]   - github_update_pull_request: Update an existing pull request in a GitHub repository.
+[2026-10-12 15:29:14] [github_mcp]   - github_update_pull_request_branch: Update the branch of a pull request with the latest changes from the base branch.
