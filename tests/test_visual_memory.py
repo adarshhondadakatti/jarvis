@@ -30,16 +30,43 @@ from memory.event_memory import EventMemory
 
 # ── Fixtures ───────────────────────────────────────────────────────────────────
 
+# Modules that captured the DB/media paths by value at import time. The
+# fixture below patches each one, otherwise a test would write through to the
+# real memory/jarvis_memory.db while only memory.db looked redirected.
+_PATH_OWNERS = ("memory.db", "memory.vector_store", "memory.face_memory",
+                "memory.media_memory")
+
+
 @pytest.fixture(autouse=True)
-def clean_db():
-    """Reset the database before each test."""
-    # Remove existing database
-    for suffix in ["", "-wal", "-shm"]:
-        p = Path(str(DB_PATH) + suffix)
-        if p.exists():
-            p.unlink()
-    if MEDIA_DIR.exists():
-        shutil.rmtree(MEDIA_DIR)
+def clean_db(tmp_path, monkeypatch):
+    """
+    Reset the database before each test — against a throwaway DB.
+
+    Every test gets its own temp directory, so the developer's real
+    memory/jarvis_memory.db and memory/storage/media/ are never read or
+    deleted. (This fixture used to unlink the live DB.)
+    """
+    temp_db    = tmp_path / "jarvis_memory.db"
+    temp_media = tmp_path / "storage" / "media"
+    temp_media.mkdir(parents=True, exist_ok=True)
+
+    # memory.db's own functions read its module globals ...
+    monkeypatch.setattr(sys.modules["memory.db"], "DB_PATH", temp_db)
+    monkeypatch.setattr(sys.modules["memory.db"], "MEDIA_DIR", temp_media)
+
+    # ... and the modules that imported those names by value have their own.
+    for mod_name in _PATH_OWNERS:
+        mod = sys.modules.get(mod_name)
+        if mod is None:
+            continue
+        if hasattr(mod, "DB_PATH"):
+            monkeypatch.setattr(mod, "DB_PATH", temp_db)
+        if hasattr(mod, "MEDIA_DIR"):
+            monkeypatch.setattr(mod, "MEDIA_DIR", temp_media)
+
+    # This test module imported them by value too.
+    monkeypatch.setattr(sys.modules[__name__], "DB_PATH", temp_db)
+    monkeypatch.setattr(sys.modules[__name__], "MEDIA_DIR", temp_media)
 
     ensure_db_ready()
     reset_vector_store()
@@ -57,13 +84,9 @@ def clean_db():
             conn.close()
 
     yield
-    # Cleanup after test
-    for suffix in ["", "-wal", "-shm"]:
-        p = Path(str(DB_PATH) + suffix)
-        if p.exists():
-            p.unlink()
-    if MEDIA_DIR.exists():
-        shutil.rmtree(MEDIA_DIR)
+
+    # tmp_path is removed by pytest; just drop cached connections/state.
+    reset_vector_store()
 
 
 def make_test_image(size=(100, 100), color=(255, 0, 0)):

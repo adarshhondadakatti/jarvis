@@ -283,7 +283,7 @@ def _generate_with_retry(model, prompt: str, max_retries: int = 3, base_delay: f
     raise RuntimeError("Gemini summarization failed: max retries reached without response.")
 
 
-def summarize_text(text: str, style: str = "concise") -> str:
+def summarize_text(text: str, style: str = "concise", progress=None) -> str:
     """
     Map-reduce summarization: short documents get one Gemini call; long
     documents are chunked, each chunk summarized, then the partial
@@ -301,15 +301,21 @@ def summarize_text(text: str, style: str = "concise") -> str:
 
     chunks = _chunk(text)
     partial_summaries = []
+    _n = len(chunks)
     for i, chunk in enumerate(chunks, 1):
+        if progress:
+            progress(0.3 + 0.55 * (i - 1) / _n,
+                     f"summarizing part {i}/{_n}")
         resp = _generate_with_retry(
             model,
-            f"This is part {i} of {len(chunks)} of a longer document. "
+            f"This is part {i} of {_n} of a longer document. "
             f"Summarize just this part concisely, preserving key facts and figures:\n\n{chunk}"
         )
         partial_summaries.append(resp.text.strip())
 
     combined = "\n\n".join(partial_summaries)
+    if progress:
+        progress(0.9, "combining parts")
     final = _generate_with_retry(
         model,
         f"{prompt_instruction} The following are summaries of consecutive parts "
@@ -321,10 +327,14 @@ def summarize_text(text: str, style: str = "concise") -> str:
 
 # ── Orchestration ────────────────────────────────────────────────────────
 
-def summarize_file(path: Path, style: str = "concise", force: bool = False) -> dict:
+def summarize_file(path: Path, style: str = "concise", force: bool = False,
+                   progress=None) -> dict:
     """
     Full pipeline: cache check → extract → summarize → cache store.
     Returns {"summary": str, "cached": bool, "chars": int}.
+
+    ``progress`` is an optional callable ``(fraction, note)``; chunked
+    map-reduce reports per chunk, which is where the time actually goes.
     """
     file_hash = _file_hash(path)
 
@@ -333,11 +343,15 @@ def summarize_file(path: Path, style: str = "concise", force: bool = False) -> d
         if cached:
             return {"summary": cached, "cached": True, "chars": len(cached)}
 
+    if progress:
+        progress(0.1, "extracting text")
     text = extract_text(path)
     if not text.strip():
         raise RuntimeError("Document appears to be empty.")
 
-    summary = summarize_text(text, style=style)
+    if progress:
+        progress(0.3, f"{len(text):,} chars — summarizing")
+    summary = summarize_text(text, style=style, progress=progress)
     _cache_set(file_hash, style, summary)
     return {"summary": summary, "cached": False, "chars": len(text)}
 
@@ -345,7 +359,7 @@ def summarize_file(path: Path, style: str = "concise", force: bool = False) -> d
 # ── Tool-facing wrapper — call this from file_processor.py's dispatch   ──
 # ── for the "summarize" action across pdf / docx / text / pptx types.   ──
 
-def summarize(parameters: dict = None, player=None) -> str:
+def summarize(parameters: dict = None, player=None, progress=None) -> str:
     params = parameters or {}
     file_path_str = params.get("file_path", "").strip()
     if not file_path_str:
@@ -371,7 +385,7 @@ def summarize(parameters: dict = None, player=None) -> str:
         player.write_log(f"[file_summarizer] {path.name} (style={style})")
 
     try:
-        result = summarize_file(path, style=style, force=force)
+        result = summarize_file(path, style=style, force=force, progress=progress)
     except ScannedDocumentError as e:
         _log(f"summarize(): ScannedDocumentError — {e}")
         # Deliberately NOT swallowed here — let it propagate so

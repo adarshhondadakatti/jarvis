@@ -1,9 +1,11 @@
 .claude/*
 .jarvis/*
-*.pyc
+__pycache__/
+*.py[cod]
 config/*
 !config/*.py
 *.vsix
 logs/*
 memory/*
 *.db
+.pytest_cache/

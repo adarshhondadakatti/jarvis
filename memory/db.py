@@ -275,6 +275,32 @@ def init_db() -> None:
                 """
             )
 
+            # ── Task tracking (async task queue / parallel tool calls) ────────
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id           TEXT PRIMARY KEY,
+                    tool         TEXT    NOT NULL,
+                    args         TEXT,
+                    status       TEXT    NOT NULL DEFAULT 'queued',
+                    progress     REAL    NOT NULL DEFAULT 0.0,
+                    progress_note TEXT,
+                    result       TEXT,
+                    error        TEXT,
+                    parent_id    INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+                    started_at   TEXT,
+                    updated_at   TEXT,
+                    finished_at  TEXT
+                )
+                """
+            )
+            for ddl in (
+                "CREATE INDEX IF NOT EXISTS idx_tasks_status  ON tasks(status)",
+                "CREATE INDEX IF NOT EXISTS idx_tasks_started ON tasks(started_at)",
+                "CREATE INDEX IF NOT EXISTS idx_tasks_parent  ON tasks(parent_id)",
+            ):
+                conn.execute(ddl)
+
             conn.commit()
         finally:
             conn.close()

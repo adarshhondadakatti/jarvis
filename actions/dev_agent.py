@@ -441,6 +441,7 @@ def _build_project(
     timeout: int,
     speak=None,
     player=None,
+    progress=None,
 ) -> str:
 
     def log(msg: str):
@@ -448,6 +449,12 @@ def _build_project(
         if player:
             player.write_log(f"[DevAgent] {msg}")
 
+    def _at(frac: float, note: str):
+        """Report progress; a no-op when the caller passed no reporter."""
+        if progress:
+            progress(frac, note)
+
+    _at(0.05, "planning project structure")
     log("Planning project structure...")
     try:
         plan = _plan_project(description, language)
@@ -479,11 +486,14 @@ def _build_project(
 
     file_codes: dict[str, str] = {}
 
-    for file_info in sorted_files:
+    # Writing files is the long pole — spread progress across them.
+    _n_files = max(1, len(sorted_files))
+    for _i, file_info in enumerate(sorted_files, 1):
         file_path = file_info.get("path", "")
         if not file_path:
             continue
 
+        _at(0.15 + 0.45 * (_i - 1) / _n_files, f"writing {file_path}")
         log(f"Writing {file_path}...")
         for attempt in range(2):
             try:
@@ -514,15 +524,18 @@ def _build_project(
         return msg
 
     if dependencies:
+        _at(0.65, "installing dependencies")
         install_result = _install_dependencies(dependencies, project_dir)
         log(install_result)
 
     _open_vscode(project_dir)
 
     last_output   = ""
-    auto_installs = 0  
+    auto_installs = 0
 
     for attempt in range(1, MAX_FIX_ATTEMPTS + 1):
+        _at(0.7 + 0.28 * (attempt - 1) / MAX_FIX_ATTEMPTS,
+            f"test run {attempt}/{MAX_FIX_ATTEMPTS}")
         log(f"Running project (attempt {attempt}/{MAX_FIX_ATTEMPTS})...")
         last_output = _run_project(run_command, project_dir, timeout)
         log(f"Output preview: {last_output[:150]}")
@@ -533,6 +546,7 @@ def _build_project(
                 f"Built in {attempt} attempt{'s' if attempt > 1 else ''}. "
                 f"Saved to: {project_dir}"
             )
+            _at(1.0, "done", )
             if speak: speak(msg)
             return f"{msg}\n\nOutput:\n{last_output}"
 
@@ -549,6 +563,7 @@ def _build_project(
                 continue
 
         log(f"Fixing errors (type: {error_type})...")
+        _at(0.75 + 0.24 * attempt / MAX_FIX_ATTEMPTS, f"fixing: {error_type}")
         try:
             updated = _fix_files(
                 error_output=last_output,
@@ -582,6 +597,7 @@ def dev_agent(
     player=None,
     session_memory=None,
     speak=None,
+    progress=None,
 ) -> str:
     p            = parameters or {}
     description  = p.get("description", "").strip()
@@ -599,4 +615,5 @@ def dev_agent(
         timeout      = timeout,
         speak        = speak,
         player       = player,
+        progress     = progress,
     )

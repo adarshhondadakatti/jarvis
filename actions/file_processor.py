@@ -1030,7 +1030,7 @@ def _unblock_file(path: Path) -> bool:
         return True
 
 
-def file_processor(parameters: dict, player=None, speak=None) -> str:
+def file_processor(parameters: dict, player=None, speak=None, progress=None) -> str:
     from actions.file_summarizer import _log, _log_exception
 
     file_path_str = parameters.get("file_path", "").strip()
@@ -1038,6 +1038,9 @@ def file_processor(parameters: dict, player=None, speak=None) -> str:
         return "No file path provided."
 
     _log(f"[FileProcessor] Requested: '{file_path_str}'")
+
+    if progress:
+        progress(0.05, "locating file")
 
     path = Path(file_path_str)
     if not path.exists():
@@ -1082,6 +1085,8 @@ def file_processor(parameters: dict, player=None, speak=None) -> str:
     print(log_msg)
     if player:
         player.write_log(log_msg)
+    if progress:
+        progress(0.15, f"{file_type} — {path.name}"[:80])
 
     # ── Summarization routing ────────────────────────────────────────────
     # "summarize" for the document types below now goes through the shared
@@ -1091,13 +1096,24 @@ def file_processor(parameters: dict, player=None, speak=None) -> str:
     if action == "summarize" and file_type in ("pdf", "docx", "text", "pptx"):
         from actions.file_summarizer import summarize as _summarize_doc, ScannedDocumentError, _log, _log_exception
         try:
-            return _summarize_doc(parameters={**params, "file_path": str(path)}, player=player)
+            if progress:
+                progress(0.3, "extracting text")
+            return _summarize_doc(
+                parameters={**params, "file_path": str(path)},
+                player=player,
+                progress=progress,
+            )
         except ScannedDocumentError as e:
             _log(f"[FileProcessor] {e} — falling back to image-based summarization")
+            if progress:
+                progress(0.3, "scanned PDF — using vision")
             return _summarize_pdf_as_images(path, "summarize", params)
         except Exception as e:
             _log_exception(f"[FileProcessor] summarize routing failed on {path}")
             return f"Summarization failed: {e}"
+
+    if progress:
+        progress(0.3, f"{action or 'processing'} {file_type} file")
 
     if file_type == "unknown":
         try:

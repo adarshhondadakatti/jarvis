@@ -102,6 +102,9 @@ from memory.config_manager     import get_brief_enabled
 from actions.calendar_google   import calendar_google_action
 from actions.calendar_teams    import calendar_teams_action
 from actions.meeting_scheduler import meeting_scheduler_action
+from core.task_runner     import TaskRunner, run_batch, describe_batch
+from core.progress        import Progress
+from memory import task_store
 
 
 # ── Ignore warnings ───────────────────────────────────────────────────────────
@@ -529,6 +532,35 @@ TOOL_DECLARATIONS = [
                 "top_k":  {"type": "INTEGER", "description": "Max results to return (default 5)"},
             },
             "required": ["query"]
+        }
+    },
+    {
+        "name": "task_status",
+        "description": (
+            "Reports what Jarvis is currently working on and what it has recently finished. "
+            "Every tool call Jarvis makes is recorded as a task, so this is the way to answer "
+            "questions like 'what are you doing?', 'is that done yet?', 'what failed?', or "
+            "'what's still running?'. Read this before guessing at your own progress — "
+            "especially when several things were started at once."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {
+                    "type": "STRING",
+                    "description": "'status' (default — running + recent), 'running' (only in-flight), 'recent' (only finished), or 'cancel' with a task_id.",
+                    "enum": ["status", "running", "recent", "cancel"]
+                },
+                "limit": {
+                    "type": "INTEGER",
+                    "description": "How many recent tasks to list (default 10). Ignored by 'running'."
+                },
+                "task_id": {
+                    "type": "STRING",
+                    "description": "Required for 'cancel' — the id shown in a previous status report, e.g. 't-9f3a1c2b'."
+                },
+            },
+            "required": []
         }
     },
     {
@@ -985,6 +1017,11 @@ class JarvisLive:
         self._confirm_gate = ConfirmationGate()
         self._reconnect_requested = False             # set by tools (e.g. set_voice) to force a clean reconnect
 
+        # Task tracking — every tool call gets a row in the `tasks` table so the
+        # UI and the assistant can both see what is running, what finished, and
+        # what failed. Handles live asyncio tasks for cancellation.
+        self._task_runner = TaskRunner()
+
         # GitHub MCP — populated by run() at startup (async fetch there);
         # defaults to [] here so _build_config() has something to read from
         # even if called before run() finishes discovery.
@@ -1202,6 +1239,16 @@ GITHUB ROUTING RULES:
         log.info(f"[JARVIS] 🔧 {name}  {args}")
         self.ui.set_state("THINKING")
 
+        # Record the call as a task so it shows up in "what are you working on?"
+        # and survives as a durable row. Tools that report progress can call
+        # self._task_runner.progress(task_id, ...).
+        _task = self._task_runner.register(name, args)
+        self._task_runner.start(_task)
+        # Progress reporter handed to long-running tools. Tools that accept a
+        # `progress=` kwarg call it as they work; everything else ignores it.
+        _progress = Progress(_task.task_id, name)
+        _t0 = time.monotonic()
+
         if name == "save_memory":
             category = args.get("category", "notes")
             key      = args.get("key", "")
@@ -1380,13 +1427,18 @@ GITHUB ROUTING RULES:
                 result = r or "Done."
 
             elif name == "dev_agent":
-                r = await loop.run_in_executor(None, lambda: dev_agent(parameters=args, player=self.ui, speak=self.speak))
+                r = await loop.run_in_executor(None, lambda: dev_agent(
+                    parameters=args, player=self.ui, speak=self.speak,
+                    progress=_progress,
+                ))
                 result = r or "Done."
 
             elif name == "web_search":
                 try:
                     r = await run_resilient(
-                        lambda: web_search_action(parameters=args, player=self.ui),
+                        lambda: web_search_action(
+                            parameters=args, player=self.ui, progress=_progress
+                        ),
                         name="web_search", loop=loop, timeout=20.0, retries=2,
                     )
                     result = r or "Done."
@@ -1404,7 +1456,10 @@ GITHUB ROUTING RULES:
                     args["file_path"] = self.ui.current_file
                 r = await loop.run_in_executor(
                     None,
-                    lambda: file_processor(parameters=args, player=self.ui, speak=self.speak)
+                    lambda: file_processor(
+                        parameters=args, player=self.ui, speak=self.speak,
+                        progress=_progress,
+                    )
                 )
                 result = r or "Done."
 
@@ -1725,6 +1780,37 @@ GITHUB ROUTING RULES:
                             ]
                             result = "Relevant memories found:\n" + "\n".join(lines)
 
+            elif name == "task_status":
+                _action = (args.get("action") or "status").lower().strip()
+                _limit = max(1, min(50, int(args.get("limit") or 10)))
+                if _action == "cancel":
+                    _tid = (args.get("task_id") or "").strip()
+                    if not _tid:
+                        result = "Which task should I cancel? Give me the task id, e.g. t-9f3a1c2b."
+                    elif self._task_runner.cancel(_tid):
+                        result = f"Cancelled task {_tid}."
+                    else:
+                        result = f"Task {_tid} isn't running anymore — nothing to cancel."
+                elif _action == "running":
+                    _live = self._task_runner.live_tasks()
+                    if not _live:
+                        result = "Nothing is running right now."
+                    else:
+                        result = "Still working on:\n" + "\n".join(
+                            f"  [{t.task_id}] {t.tool} ({t.elapsed:.0f}s elapsed)"
+                            for t in _live
+                        )
+                elif _action == "recent":
+                    _recent = [
+                        t for t in task_store.list_tasks(limit=_limit)
+                        if not t.is_active
+                    ]
+                    result = ("Recently finished:\n" + "\n".join(
+                        f"  {t.describe()}" for t in _recent
+                    )) if _recent else "Nothing has finished yet."
+                else:
+                    result = self._task_runner.report(limit=_limit)
+
             elif name.startswith("github_"):
                 from actions.github_mcp import call_github_tool
                 result = await call_github_tool(name, args)
@@ -1733,15 +1819,30 @@ GITHUB ROUTING RULES:
                 result = f"Unknown tool: {name}"
             
 
+        except asyncio.CancelledError:
+            self._task_runner.finish(_task, status=task_store.CANCELLED,
+                                     error="Cancelled")
+            raise
         except Exception as e:
             result = f"Tool '{name}' failed: {e}"
             traceback.print_exc()
             self.speak_error(name, e)
 
+        # Close out the task row with the result (or the failure text).
+        _failed = result.startswith(f"Tool '{name}' failed:")
+        self._task_runner.finish(
+            _task,
+            status=task_store.FAILED if _failed else None,
+            result=result if not _failed else None,
+            error=result if _failed else None,
+        )
+
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
 
-        print(f"[JARVIS] 📤 {name} → {str(result)[:80]}")
+        elapsed = time.monotonic() - _t0
+        log.info(f"[JARVIS] 📤 {name} → {str(result)[:80]} ({elapsed:.1f}s)")
+        print(f"[JARVIS] 📤 {name} → {str(result)[:80]} ({elapsed:.1f}s)")
         return types.FunctionResponse(
             id=fc.id, name=name,
             response={"result": result}
@@ -1907,11 +2008,24 @@ GITHUB ROUTING RULES:
                                 asyncio.create_task(_cam_close())
 
                     if response.tool_call:
-                        fn_responses = []
-                        for fc in response.tool_call.function_calls:
-                            log.debug(f"[JARVIS] 📞 {fc.name}")
-                            fr = await self._execute_tool(fc)
-                            fn_responses.append(fr)
+                        # Run every function call in the batch CONCURRENTLY.
+                        # They used to be awaited one at a time, so "open Chrome
+                        # and check my email" cost the sum of both calls instead
+                        # of the longer of the two — while the receive loop sat
+                        # blocked. Responses keep the API's original order.
+                        calls = list(response.tool_call.function_calls)
+                        if len(calls) > 1:
+                            log.info(
+                                f"[JARVIS] 🔧 batch of {len(calls)}: "
+                                f"{describe_batch(calls)}"
+                            )
+                            self.ui.write_log(
+                                f"⚙ Parallel: {describe_batch(calls)}"
+                            )
+                            fn_responses = await run_batch(calls, self._execute_tool)
+                        else:
+                            log.debug(f"[JARVIS] 📞 {calls[0].name}")
+                            fn_responses = [await self._execute_tool(calls[0])]
                         await self.session.send_tool_response(
                             function_responses=fn_responses
                         )

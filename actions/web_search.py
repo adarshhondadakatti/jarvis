@@ -274,6 +274,7 @@ def web_search(
     response=None,
     player=None,
     session_memory=None,
+    progress=None,
 ) -> str:
     params = parameters or {}
     query  = params.get("query", "").strip()
@@ -290,19 +291,26 @@ def web_search(
     if player:
         player.write_log(f"[Search:{mode}] {query or ', '.join(items)}")
 
+    if progress:
+        progress(0.15, f"{mode}: {query or ', '.join(items)}"[:80])
+
     print(f"[WebSearch] 🔍 mode={mode!r}  query={query!r}")
 
     try:
         if mode == "compare" and items:
-            return _compare(items, aspect)
-        if mode == "news":
-            return _news(query)
-        if mode == "research":
-            return _research(query)
-        if mode == "price":
-            return _price(query)
-        return _search(query)
-
+            out = _compare(items, aspect)
+        elif mode == "news":
+            out = _news(query)
+        elif mode == "research":
+            out = _research(query)
+        elif mode == "price":
+            out = _price(query)
+        else:
+            out = _search(query)
     except Exception as e:
         print(f"[WebSearch] ❌ All backends failed: {e}")
         return f"Search failed: {e}"
+
+    if progress:
+        progress(1.0, "done", force=True)
+    return out
