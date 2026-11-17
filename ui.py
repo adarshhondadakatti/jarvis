@@ -1936,6 +1936,14 @@ class MainWindow(QMainWindow):
         self._clipboard_sig.connect(self._show_clipboard_panel)
         self._cam_stop = threading.Event()
 
+        # Live task panel — reuses the content pane, refreshed on a timer
+        # while open. _tasks_mode is cleared by _show_content so news / search
+        # results taking over the pane also stops the refresh.
+        self._tasks_mode = False
+        self._tasks_timer = QTimer(self)
+        self._tasks_timer.setInterval(1200)
+        self._tasks_timer.timeout.connect(self._refresh_tasks)
+
         # Camera preview overlay (child of central widget, positioned in resizeEvent)
         self._cam_preview = _CameraPreview(self.centralWidget())
 
@@ -2662,6 +2670,25 @@ class MainWindow(QMainWindow):
         self._log = LogWidget()
         lay.addWidget(self._log, stretch=1)
 
+        self._tasks_btn = QPushButton("📋  TASKS")
+        self._tasks_btn.setFixedHeight(24)
+        self._tasks_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._tasks_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._tasks_btn.setToolTip(
+            "Show what Jarvis is working on right now — updates live."
+        )
+        self._tasks_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {C.DARK}; color: {C.TEXT_MED};
+                border: 1px solid {C.BORDER}; border-radius: 3px;
+            }}
+            QPushButton:hover {{
+                color: {C.PRI}; border: 1px solid {C.PRI};
+            }}
+        """)
+        self._tasks_btn.clicked.connect(self._toggle_tasks)
+        lay.addWidget(self._tasks_btn)
+
         sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
         sep.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
         lay.addWidget(sep)
@@ -2940,8 +2967,8 @@ class MainWindow(QMainWindow):
 
         return w
 
-    def _show_content(self, title: str, text: str):
-        """Slot — runs on Qt main thread. Updates and shows the content panel."""
+    def _present(self, title: str, text: str):
+        """Slot — runs on Qt main thread. Paints the content panel."""
         import time as _time
         self._content_title_lbl.setText(title.upper()[:48])
         self._content_ts_lbl.setText(_time.strftime("%H:%M:%S"))
@@ -2954,6 +2981,41 @@ class MainWindow(QMainWindow):
         if first_show:
             total = self._center_split.height()
             self._center_split.setSizes([max(total - 220, 120), 220])
+
+    def _show_content(self, title: str, text: str):
+        """Slot — runs on Qt main thread. Updates and shows the content panel."""
+        # Anything else taking the pane (news, search results) ends task mode.
+        self._stop_task_view()
+        self._present(title, text)
+
+    # ── Live task view ──────────────────────────────────────────────────────
+
+    def _refresh_tasks(self):
+        """Re-read the task table and repaint. Runs on the Qt timer."""
+        try:
+            from memory import task_store
+            report = task_store.status_report(limit=12)
+        except Exception as e:
+            report = f"Task tracking unavailable: {e}"
+        self._present("Tasks — live", report)
+
+    def _stop_task_view(self):
+        self._tasks_mode = False
+        _tmr = getattr(self, "_tasks_timer", None)
+        if _tmr is not None and _tmr.isActive():
+            _tmr.stop()
+        if hasattr(self, "_tasks_btn"):
+            self._tasks_btn.setText("📋  TASKS")
+
+    def _toggle_tasks(self):
+        """📋 TASKS button — show/hide the live task list."""
+        if self._tasks_mode:
+            self._stop_task_view()
+            return
+        self._tasks_mode = True
+        self._tasks_btn.setText("📋  TASKS ●")
+        self._refresh_tasks()
+        self._tasks_timer.start()
 
     def _build_footer(self) -> QWidget:
         w = QWidget()
